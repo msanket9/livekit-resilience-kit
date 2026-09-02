@@ -1,0 +1,47 @@
+services:
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    command: --config /etc/livekit.yaml --dev
+    volumes:
+      - ./config/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50019:50000-50019/udp"
+    networks:
+      - resilience-net
+
+  client-a:
+    build: ./client
+    container_name: client-a
+    depends_on:
+      - livekit-server
+    environment:
+      LIVEKIT_URL: ws://livekit-server:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      ROOM_NAME: resilience-test
+      PARTICIPANT_IDENTITY: client-a
+      PUBLISH_AUDIO: "true"
+    networks:
+      - resilience-net
+
+  client-b:
+    build: ./client
+    container_name: client-b
+    depends_on:
+      - livekit-server
+    environment:
+      LIVEKIT_URL: ws://livekit-server:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      ROOM_NAME: resilience-test
+      PARTICIPANT_IDENTITY: client-b
+      PUBLISH_AUDIO: "false"
+    networks:
+      - resilience-net
+
+networks:
+  resilience-net:
+    driver: bridge

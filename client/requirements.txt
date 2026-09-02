@@ -1,0 +1,3 @@
+livekit>=0.19
+livekit-api>=0.7
+numpy>=1.26
