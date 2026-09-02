@@ -13,6 +13,9 @@ publisher or subscriber persona in docker-compose:
   PUBLISH_AUDIO        "true" to publish a sine-tone track, otherwise subscribe-only
   EVENT_LOG_PATH          where to append JSON-line events (default: /data/events.jsonl)
   AUDIO_STATS_POLL_SECONDS  how often to poll subscribed-audio freeze/concealment stats (default: 2)
+  RED_ENABLED             "default" (leave LiveKit's own default, which is enabled), "true",
+                           or "false" -- lets a suite run compare concealment with RED forced
+                           off against the baseline
 """
 
 import asyncio
@@ -38,6 +41,7 @@ IDENTITY = os.environ["PARTICIPANT_IDENTITY"]
 PUBLISH_AUDIO = os.getenv("PUBLISH_AUDIO", "false").lower() == "true"
 EVENT_LOG_PATH = os.getenv("EVENT_LOG_PATH", "/data/events.jsonl")
 AUDIO_STATS_POLL_SECONDS = float(os.getenv("AUDIO_STATS_POLL_SECONDS", "2"))
+RED_ENABLED = os.getenv("RED_ENABLED", "default").lower()
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
@@ -67,8 +71,10 @@ async def publish_sine_tone(room: rtc.Room) -> None:
     source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
     track = rtc.LocalAudioTrack.create_audio_track("sine-tone", source)
     options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+    if RED_ENABLED in ("true", "false"):
+        options.red = RED_ENABLED == "true"
     await room.local_participant.publish_track(track, options)
-    log.info("published sine-tone audio track")
+    log.info("published sine-tone audio track (red=%s)", RED_ENABLED)
 
     phase = 0.0
     phase_step = 2 * np.pi * TONE_HZ / SAMPLE_RATE

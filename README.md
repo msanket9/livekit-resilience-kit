@@ -142,3 +142,36 @@ A few things worth noting in that data:
   crosses that SID boundary, goes negative, and silently reports 0 — hiding the ~19s of real
   concealment that happened on the old track right before it was torn down. The report
   generator now diffs each track SID separately and sums across SID changes within a window.
+
+## Measuring RED's actual effect
+
+LiveKit publishes tracks with RED (redundant audio encoding) enabled by default, and its
+[blog](https://livekit.com/blog/audio-quality) claims this "lets the audio stream tolerate
+~20–30% packet loss without retransmission." Rather than take that on faith, `client-a` can
+force RED on or off (`TrackPublishOptions.red`, a proto3 optional the client normally never
+touches, so it silently follows LiveKit's own default) and the same fault profile can be run
+against both, for a real before/after:
+
+```bash
+docker compose up --build -d
+./scripts/run_test_suite.sh                                         # RED at LiveKit's default (on)
+RED_ENABLED=false docker compose up -d --force-recreate --no-deps client-a
+./scripts/run_test_suite.sh                                         # RED forced off
+python3 scripts/generate_report.py --run-id <first_run_id>
+python3 scripts/generate_report.py --run-id <second_run_id>
+```
+
+Note RED only protects against *partial* packet loss (redundant copies ride in later
+packets) — it can't help against a full blackout like `gateway_dropout`/`severe_outage`, so
+`rural_4g` or `congested_wifi` are the right profiles for this comparison, not those. Actual
+measured result, same `rural_4g` profile, 60s each, only RED toggled:
+
+| RED | Quality (Excellent/Good/Poor/Lost) | Concealed audio |
+|---|---|---|
+| on (default) | 100.0% / 0% / 0% / 0% | 0.27s |
+| off | 50.0% / 50.0% / 0% / 0% | 2.15s |
+
+RED cut concealed audio by roughly 8x under identical injected loss/jitter/bandwidth, and
+kept `ConnectionQuality` steady at "Excellent" instead of dropping half the time to "Good."
+The vendor claim holds up — and now there's a measured number behind it instead of just a
+blog post.

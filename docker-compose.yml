@@ -39,6 +39,7 @@ services:
       PARTICIPANT_IDENTITY: client-a
       PUBLISH_AUDIO: "true"
       EVENT_LOG_PATH: /data/client-a-events.jsonl
+      RED_ENABLED: ${RED_ENABLED:-default}
     volumes:
       - ./data:/data
     networks:
