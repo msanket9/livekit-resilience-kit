@@ -64,6 +64,7 @@ running client container. Each profile in [`faults/`](faults/) is a standalone s
 ./faults/rural_4g.sh [uplink_container] [duration_seconds] [downlink_container]
 ./faults/gateway_dropout.sh [target_container] [duration_seconds] [dropout_seconds] [interval_seconds]
 ./faults/congested_wifi.sh [target_container] [duration_seconds]
+./faults/severe_outage.sh [target_container] [duration_seconds] [outage_seconds]
 ```
 
 | Profile | Loss | Jitter | Latency | Bandwidth | Notes |
@@ -72,6 +73,7 @@ running client container. Each profile in [`faults/`](faults/) is a standalone s
 | `rural_4g` | 3.5% | ±75ms | 100ms | 2 Mbps up / 5 Mbps down | steady degradation |
 | `gateway_dropout` | periodic 100% loss, 4s every 45s | — | — | — | mirrors a cellular gateway going dark and reconnecting |
 | `congested_wifi` | 1.5% (correlated/bursty) | ±30ms | 30ms | 10 Mbps shared | stretch profile |
+| `severe_outage` | one continuous 100% loss window, 25s by default | — | — | — | long enough to actually trip LiveKit's reconnect logic — `gateway_dropout`'s short outages never do (see below) |
 
 With the stack up, verify a profile actually lands (ping for loss/latency, `iperf3` for
 bandwidth):
@@ -117,13 +119,26 @@ Sample output:
 
 | Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio |
 |---|---|---|---|---|---|
-| clean | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s |
-| rural_4g | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.4s |
-| gateway_dropout | 45s | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 4.12s |
+| clean | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 1.45s |
+| rural_4g | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.15s |
+| gateway_dropout | 45s | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 3.91s |
 | congested_wifi | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s |
+| severe_outage | 45s | 66.7% / 0% / 0% / 33.3% | 1 | 18.48s | 19.3s |
 
-Two things worth noting in that data: a single ~4s gateway dropout doesn't trip LiveKit's
-client-side reconnect logic (0 reconnects) — it shows up as a connection-quality dip and
-concealed audio instead, not a full ICE restart. And `concealed_samples` is a more sensitive
-signal than the connection-quality label for milder profiles: `rural_4g` shows measurable
-concealed audio (0.4s) while its quality label stayed "Excellent" the whole window.
+A few things worth noting in that data:
+
+- A short ~4s `gateway_dropout` never trips LiveKit's client-side reconnect logic (0
+  reconnects) — it only shows up as a connection-quality dip and concealed audio. It took a
+  continuous 25s outage (`severe_outage`) to actually force a `reconnecting` → `reconnected`
+  cycle, which then took ~18.5s to recover — real numbers for a mechanism LiveKit ships but
+  doesn't otherwise expose.
+- `concealed_samples` is a more sensitive signal than the connection-quality label for
+  milder profiles: `rural_4g` shows measurable concealed audio (0.15s) while its quality
+  label stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
+  scorer excluding jitter/RTT from its score (see "Why this exists" above).
+- Computing concealed-audio duration correctly across a `severe_outage` window took a fix:
+  a full reconnect re-subscribes to a **new track SID** whose cumulative WebRTC counters
+  reset to 0, so a naive "last value at window end minus last value at window start" diff
+  crosses that SID boundary, goes negative, and silently reports 0 — hiding the ~19s of real
+  concealment that happened on the old track right before it was torn down. The report
+  generator now diffs each track SID separately and sums across SID changes within a window.

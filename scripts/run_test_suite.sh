@@ -12,7 +12,7 @@ MANIFEST="${DATA_DIR}/run_manifest.jsonl"
 TARGET_CONTAINER="${TARGET_CONTAINER:-client-a}"
 DURATION_SECONDS="${DURATION_SECONDS:-60}"
 # shellcheck disable=SC2206
-PROFILES=(${PROFILES:-clean rural_4g gateway_dropout congested_wifi})
+PROFILES=(${PROFILES:-clean rural_4g gateway_dropout congested_wifi severe_outage})
 
 now() { python3 -c "import time; print(time.time())"; }
 

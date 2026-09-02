@@ -89,29 +89,44 @@ def reconnect_stats(client_a_events, start_ts, end_ts):
     }
 
 
-def last_value_at_or_before(track_stats_events, ts, field):
-    candidates = [e for e in track_stats_events if e["ts"] <= ts]
-    if not candidates:
+def _sid_delta(events_for_sid, start_ts, end_ts, field):
+    """Delta of a cumulative per-track-sid counter within [start_ts, end_ts],
+    baselined against the last sample before start_ts (0 if the sid has no
+    sample before the window, i.e. it was (re)subscribed inside it)."""
+    events_for_sid = sorted(events_for_sid, key=lambda e: e["ts"])
+    relevant = [e for e in events_for_sid if e["ts"] <= end_ts]
+    if not relevant or relevant[-1]["ts"] < start_ts:
         return 0
-    return max(candidates, key=lambda e: e["ts"]).get(field, 0)
+    before = [e for e in relevant if e["ts"] < start_ts]
+    baseline = before[-1].get(field, 0) if before else 0
+    return max(0, relevant[-1].get(field, 0) - baseline)
 
 
 def concealment_stats(client_b_events, start_ts, end_ts):
+    """Sum of concealed-sample deltas within [start_ts, end_ts], computed
+    per subscribed-track-sid and summed across sids.
+
+    A full LiveKit reconnect re-subscribes to a NEW track sid whose
+    cumulative WebRTC counters reset to 0. Naively diffing "last value at
+    end" minus "last value at start" across that sid change goes negative
+    and gets clamped to 0 -- silently hiding real concealment that happened
+    on the old track right before it was torn down. Diffing per-sid and
+    summing avoids that."""
     stats_events = [e for e in client_b_events if e["event"] == "track_stats"]
-    concealed_delta = max(
-        0,
-        last_value_at_or_before(stats_events, end_ts, "concealed_samples")
-        - last_value_at_or_before(stats_events, start_ts, "concealed_samples"),
+    by_sid = defaultdict(list)
+    for e in stats_events:
+        by_sid[e["track_sid"]].append(e)
+
+    concealed_total = sum(
+        _sid_delta(events, start_ts, end_ts, "concealed_samples") for events in by_sid.values()
     )
-    silent_delta = max(
-        0,
-        last_value_at_or_before(stats_events, end_ts, "silent_concealed_samples")
-        - last_value_at_or_before(stats_events, start_ts, "silent_concealed_samples"),
+    silent_total = sum(
+        _sid_delta(events, start_ts, end_ts, "silent_concealed_samples") for events in by_sid.values()
     )
     return {
-        "concealed_samples": concealed_delta,
-        "silent_concealed_samples": silent_delta,
-        "concealed_seconds_approx": round(concealed_delta / SAMPLE_RATE, 2),
+        "concealed_samples": concealed_total,
+        "silent_concealed_samples": silent_total,
+        "concealed_seconds_approx": round(concealed_total / SAMPLE_RATE, 2),
     }
 
 

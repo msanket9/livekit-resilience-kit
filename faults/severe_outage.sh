@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Severe outage profile: one long full-loss window, long enough to actually
+# trip LiveKit's own reconnect logic. gateway_dropout's short 4-5s outages
+# were verified to only show up as a connection-quality dip and concealed
+# audio -- never a real reconnect. This profile exists to exercise and
+# measure the quick/full-reconnect mechanism itself.
+set -euo pipefail
+
+TARGET_CONTAINER="${1:-client-a}"
+DURATION_SECONDS="${2:-35}"
+OUTAGE_SECONDS="${3:-25}"
+
+if [ "${OUTAGE_SECONDS}" -ge "${DURATION_SECONDS}" ]; then
+  echo "OUTAGE_SECONDS must be less than DURATION_SECONDS (need time left to observe recovery)" >&2
+  exit 1
+fi
+
+echo "== Severe outage: ${OUTAGE_SECONDS}s of 100% loss on ${TARGET_CONTAINER}, then $((DURATION_SECONDS - OUTAGE_SECONDS))s to observe recovery =="
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gaiaadm/pumba \
+  netem --duration "${OUTAGE_SECONDS}s" loss --percent 100 \
+  -- "${TARGET_CONTAINER}"
+
+sleep "$((DURATION_SECONDS - OUTAGE_SECONDS))"
+echo "== Severe outage profile done =="
