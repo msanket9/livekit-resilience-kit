@@ -1,8 +1,22 @@
 services:
+  webhook-receiver:
+    build: ./webhook_receiver
+    container_name: webhook-receiver
+    environment:
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      WEBHOOK_LOG_PATH: /data/webhooks.jsonl
+    volumes:
+      - ./data:/data
+    networks:
+      - resilience-net
+
   livekit-server:
     image: livekit/livekit-server:latest
     container_name: livekit-server
     command: --config /etc/livekit.yaml --dev
+    depends_on:
+      - webhook-receiver
     volumes:
       - ./config/livekit.yaml:/etc/livekit.yaml:ro
     ports:
@@ -24,6 +38,9 @@ services:
       ROOM_NAME: resilience-test
       PARTICIPANT_IDENTITY: client-a
       PUBLISH_AUDIO: "true"
+      EVENT_LOG_PATH: /data/client-a-events.jsonl
+    volumes:
+      - ./data:/data
     networks:
       - resilience-net
 
@@ -39,6 +56,9 @@ services:
       ROOM_NAME: resilience-test
       PARTICIPANT_IDENTITY: client-b
       PUBLISH_AUDIO: "false"
+      EVENT_LOG_PATH: /data/client-b-events.jsonl
+    volumes:
+      - ./data:/data
     networks:
       - resilience-net
 

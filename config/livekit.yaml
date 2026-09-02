@@ -11,4 +11,9 @@ rtc:
 keys:
   devkey: secret
 
+webhook:
+  api_key: devkey
+  urls:
+    - http://webhook-receiver:8080/webhook
+
 log_level: info

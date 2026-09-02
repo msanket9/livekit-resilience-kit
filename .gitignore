@@ -7,4 +7,6 @@ venv/
 reports/*.json
 reports/*.html
 !reports/.gitkeep
+data/*.jsonl
+!data/.gitkeep
 *.log

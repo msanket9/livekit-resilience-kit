@@ -2,8 +2,7 @@
 
 **Work in progress.** Tests how a LiveKit deployment behaves under degraded network
 conditions — packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect —
-not just under scale. Full write-up lands once metrics capture and the report generator
-are in place.
+not just under scale. Full write-up lands once the report generator is in place.
 
 ## Local stack
 
@@ -48,3 +47,21 @@ bandwidth):
 
 (`./scripts/pumba_smoke_test.sh` runs a single minimal delay injection if you just want a
 quick sanity check instead of the full profile sweep.)
+
+## Metrics capture
+
+While the stack is up, LiveKit's own signals are captured as JSON lines under `./data/`:
+
+- `data/client-a-events.jsonl`, `data/client-b-events.jsonl` — one line per client-side
+  event: `connect_start`/`connected` (time-to-first-connect), `connection_quality_changed`,
+  `reconnecting`/`reconnected` (ICE-restart proxy), `track_subscribed`/`track_unsubscribed`,
+  `disconnected`, and `freeze` (a gap over `FREEZE_THRESHOLD_MS`, default 300ms, between
+  consecutive frames on a subscribed audio track).
+- `data/webhooks.jsonl` — LiveKit server webhooks (`room_started`, `participant_joined`,
+  `track_published`, `participant_left`, `room_finished`, ...), verified and logged by the
+  `webhook-receiver` service.
+
+These files accumulate for the life of a `docker compose up` session — run
+`rm -f data/*.jsonl` (or `docker compose down && docker compose up`) before a fresh test
+run if you want a clean slate. A report generator that turns these into a clean-vs-degraded
+comparison is next.
