@@ -4,6 +4,41 @@
 conditions — packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect —
 not just under scale.
 
+## Why this exists
+
+LiveKit's own tooling (`lk load-test`, `lk perf agent-load-test`) tests **scale**: how many
+participants, how many rooms, how much throughput a deployment can handle, assuming the
+network itself is clean. It doesn't test **degradation** — what actually happens to
+connection quality, reconnect time, and audio continuity when the network is bad. That's a
+routine condition for any deployment off a clean fiber/office link: call centers on
+congested lines, field-ops apps on cellular, IoT gateways that blink in and out.
+
+I've lived that gap. Running Saafwater's IoT platform — 80+ ESP32/Modbus field devices on
+cellular backhaul across Goa — meant constantly debugging PUSR M100 cellular gateways going
+randomly offline. I built a synthetic evaluation harness that cut incident-detection time
+from 4+ hours to under 5 minutes. This project applies the same instinct — test the real
+failure mode, not just the happy path — to LiveKit's real-time transport layer, using
+[Pumba](https://github.com/alexei-led/pumba) (proven Docker chaos-engineering) for fault
+injection and LiveKit's own signals for the evidence.
+
+### How this differs from LiveKit's own tooling
+
+LiveKit already ships real resilience *mechanisms* — this kit doesn't duplicate them, it
+verifies them against actual bad-network conditions instead of assuming they hold:
+
+| | LiveKit's own tooling | This kit |
+|---|---|---|
+| `lk load-test` / `lk perf agent-load-test` | Scale: concurrent publishers/subscribers per room, CPU/bandwidth per SFU node, on an assumed-clean network ([benchmark docs](https://docs.livekit.io/transport/self-hosting/benchmark/)) | Degradation: real packet loss, jitter, bandwidth caps, and cellular-style drop/reconnect injected into real client containers |
+| `ConnectionQuality` | A live signal computed in production from packet loss, video-layer delivery, and bitrate — jitter/RTT are explicitly excluded from the score ([LiveKit KB](https://kb.livekit.io/articles/2455399507-how-is-connection-quality-determined)) | Captured and correlated against the specific fault that caused it, per profile, in a comparison report |
+| RED + Opus FEC | Enabled by default; LiveKit says this lets audio tolerate "~20–30% packet loss without retransmission" on Chromium/native SDKs ([LiveKit blog](https://livekit.com/blog/audio-quality)) | Measured directly via WebRTC's own `concealed_samples` stat — how much audio is actually being concealed under a given fault, not just the vendor's claim |
+| Reconnect logic | A two-tier quick-reconnect (resume signaling + ICE restart) escalating to full reconnect, built into every client SDK ([Swift SDK guide](https://livekit-client-sdk-swift.mintlify.app/guides/reconnection)) | Counted and timed per fault profile — including the finding that a short ~4-5s outage degrades quality and conceals audio without tripping a full reconnect at all |
+
+None of this is a knock on LiveKit — RED, adaptive reconnect, and `ConnectionQuality` are
+solid engineering. But there's no first-party tool in LiveKit's own ecosystem that
+deliberately breaks the network to confirm those mechanisms actually hold up in practice
+(their GitHub org's own testing tools — `livekit-cli`'s load-tester and `chrometester` — are
+both scale-oriented, not fault-injection). That's the gap this fills.
+
 ## Local stack
 
 Brings up a local LiveKit server (dev mode) plus two containerized Python clients
