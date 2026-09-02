@@ -2,7 +2,7 @@
 
 **Work in progress.** Tests how a LiveKit deployment behaves under degraded network
 conditions — packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect —
-not just under scale. Full write-up lands once the report generator is in place.
+not just under scale.
 
 ## Local stack
 
@@ -55,13 +55,40 @@ While the stack is up, LiveKit's own signals are captured as JSON lines under `.
 - `data/client-a-events.jsonl`, `data/client-b-events.jsonl` — one line per client-side
   event: `connect_start`/`connected` (time-to-first-connect), `connection_quality_changed`,
   `reconnecting`/`reconnected` (ICE-restart proxy), `track_subscribed`/`track_unsubscribed`,
-  `disconnected`, and `freeze` (a gap over `FREEZE_THRESHOLD_MS`, default 300ms, between
-  consecutive frames on a subscribed audio track).
+  `disconnected`, and `track_stats` (polled every `AUDIO_STATS_POLL_SECONDS`, default 2s —
+  WebRTC's own `concealed_samples`/`total_freeze_duration` for a subscribed audio track).
+  Frame-arrival gaps turned out not to be a usable freeze signal: Opus packet-loss
+  concealment keeps synthesizing filler frames on schedule during a real outage, so
+  `concealed_samples` — not gap detection — is what actually reflects audio loss.
 - `data/webhooks.jsonl` — LiveKit server webhooks (`room_started`, `participant_joined`,
   `track_published`, `participant_left`, `room_finished`, ...), verified and logged by the
   `webhook-receiver` service.
 
 These files accumulate for the life of a `docker compose up` session — run
 `rm -f data/*.jsonl` (or `docker compose down && docker compose up`) before a fresh test
-run if you want a clean slate. A report generator that turns these into a clean-vs-degraded
-comparison is next.
+run if you want a clean slate.
+
+## Running the full suite + report
+
+With the stack up, run every profile back-to-back and generate a clean-vs-degraded
+comparison:
+
+```bash
+./scripts/run_test_suite.sh          # DURATION_SECONDS=60 PROFILES="clean rural_4g ..." to override
+python3 scripts/generate_report.py   # writes reports/report-<run_id>.{json,md,html}
+```
+
+Sample output:
+
+| Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio |
+|---|---|---|---|---|---|
+| clean | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s |
+| rural_4g | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.4s |
+| gateway_dropout | 45s | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 4.12s |
+| congested_wifi | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s |
+
+Two things worth noting in that data: a single ~4s gateway dropout doesn't trip LiveKit's
+client-side reconnect logic (0 reconnects) — it shows up as a connection-quality dip and
+concealed audio instead, not a full ICE restart. And `concealed_samples` is a more sensitive
+signal than the connection-quality label for milder profiles: `rural_4g` shows measurable
+concealed audio (0.4s) while its quality label stayed "Excellent" the whole window.

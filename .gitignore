@@ -6,6 +6,7 @@ venv/
 .DS_Store
 reports/*.json
 reports/*.html
+reports/*.md
 !reports/.gitkeep
 data/*.jsonl
 !data/.gitkeep
