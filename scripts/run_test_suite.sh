@@ -23,6 +23,30 @@ PROFILES=(${PROFILES:-clean rural_4g gateway_dropout congested_wifi severe_outag
 
 now() { python3 -c "import time; print(time.time())"; }
 
+# Values reach Python as argv, not spliced into its source. Interpolating them
+# meant a profile name or duration carrying a quote produced a SyntaxError
+# instead of a manifest line, and a DURATION_SECONDS of "60s" produced JSON that
+# was not valid JSON -- the report generator would then fail on a run that had
+# otherwise completed fine. Python also validates duration_s as a number here,
+# so a bad value is caught on the first profile rather than at report time.
+record_profile() {
+  python3 - "${MANIFEST}" "${RUN_ID}" "$1" "${DURATION_SECONDS}" "$2" "$3" <<'PY'
+import json, sys
+manifest, run_id, profile, duration_s, start_ts, end_ts = sys.argv[1:7]
+duration = float(duration_s)
+with open(manifest, "a") as f:
+    f.write(json.dumps({
+        "run_id": run_id,
+        "profile": profile,
+        # int when integral, so the rendered "Duration" cell stays "35s" rather
+        # than becoming "35.0s"; fractional durations are still accepted.
+        "duration_s": int(duration) if duration.is_integer() else duration,
+        "start_ts": float(start_ts),
+        "end_ts": float(end_ts),
+    }) + "\n")
+PY
+}
+
 CURRENT_FAULT_PID=""
 INTERRUPTED=0
 
@@ -64,7 +88,10 @@ for profile in "${PROFILES[@]}"; do
     continue
   fi
 
-  if [ "${first_profile}" -eq 0 ] && [ "${COOLDOWN_SECONDS}" -gt 0 ]; then
+  # String compare, not `-gt`: COOLDOWN_SECONDS is passed straight to sleep,
+  # which accepts fractional seconds, and `[ 1.5 -gt 0 ]` is an error that
+  # `set -e` turns into a dead suite.
+  if [ "${first_profile}" -eq 0 ] && [ "${COOLDOWN_SECONDS}" != "0" ]; then
     echo "-- cooldown ${COOLDOWN_SECONDS}s (not measured) --"
     sleep "${COOLDOWN_SECONDS}"
   fi
@@ -95,17 +122,7 @@ for profile in "${PROFILES[@]}"; do
     continue
   fi
 
-  python3 -c "
-import json
-with open('${MANIFEST}', 'a') as f:
-    f.write(json.dumps({
-        'run_id': '${RUN_ID}',
-        'profile': '${profile}',
-        'duration_s': ${DURATION_SECONDS},
-        'start_ts': ${start_ts},
-        'end_ts': ${end_ts},
-    }) + '\n')
-"
+  record_profile "${profile}" "${start_ts}" "${end_ts}"
 done
 
 echo

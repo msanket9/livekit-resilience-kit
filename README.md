@@ -158,18 +158,22 @@ full table is 11 columns wide, scroll right in the `.html` version for the agent
 
 | Profile | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio | Agent turns (detected, ok/failed) | Avg turn length |
 |---|---|---|---|---|---|---|
-| clean | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s | 5 (5/0) | 3.97s |
-| rural_4g | 100.0% / 0% / 0% / 0% | 0 | — | 0.29s | 6 (6/0) | 3.99s |
-| gateway_dropout | 58.4% / 27.8% / 13.9% / 0% | 0 | — | 3.94s | 6 (6/0) | 3.71s |
-| congested_wifi | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s | 5 (5/0) | 4.01s |
-| severe_outage | 45.7% / 0% / 0% / 54.3% | 1 | 12.41s | 19.06s | 2 (2/0) | 3.54s |
+| clean | 100.0% / 0% / 0% / 0% | 0 | — | 0.01s | 7 (7/0) | 3.97s |
+| rural_4g | 100.0% / 0% / 0% / 0% | 0 | — | 0.89s | 6 (6/0) | 3.99s |
+| gateway_dropout | 57.4% / 28.4% / 14.2% / 0% | 0 | — | 4.24s | 5 (5/0) | 3.93s |
+| congested_wifi | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s | 6 (6/0) | 3.96s |
+| severe_outage | 45.1% / 0% / 0% / 54.9% | 1 | 13.42s | 19.41s | 2 (2/0) | 2.62s |
 
 The quality percentages are **time-weighted** — the share of the window actually spent at
 each level. `connection_quality_changed` fires only on a change, so counting the events
-weights the result by number of transitions instead, and the two disagree badly: the
-`severe_outage` window above reads 33.3% LOST by event count against 54.3% by time. The
-event-count version also flattered the result, which is the wrong direction for a
-resilience report to be wrong in.
+weights the result by number of transitions instead, and the two are simply unrelated
+quantities. In the `severe_outage` window above, event counting reads 50.0% LOST against
+54.9% by time; across the eleven recorded `severe_outage` windows the event-count reading
+lands on 50.0% ten times and 100.0% once, while the time-weighted figure ranges from 41.2%
+to 55.3%. The error is not consistently in one direction — an earlier revision of this
+README said the event-count version flattered the result, and that is only true of the
+windows it happened to be written from. It is unstable in both directions, which is the
+actual reason not to report it.
 
 A few things worth noting in that data:
 
@@ -183,11 +187,12 @@ A few things worth noting in that data:
   stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
   scorer excluding jitter/RTT from its score (see "Why this exists" above).
 - **Turn count, not turn failure, is what degrades.** `turns_failed` counts turns the VAD
-  opened but never completed, and across 39 recorded profile windows it has been non-zero
-  exactly twice. When audio stops arriving the VAD has nothing to fail on — it simply never
-  opens a turn. `severe_outage` above shows 2 turns where `clean` shows 5, and that drop is
-  the real signal. The report shows detected count alongside the ok/failed split for exactly
-  this reason; the split alone reads "2 (2/0)" and looks like a clean sweep.
+  opened but never completed, and across the 58 recorded profile windows it has been
+  non-zero exactly once. When audio stops arriving the VAD has nothing to fail on — it
+  simply never opens a turn. `severe_outage` above shows 2 turns where `clean` shows 7, and
+  that drop is the real signal. The report shows detected count alongside the ok/failed
+  split for exactly this reason; the split alone reads "2 (2/0)" and looks like a clean
+  sweep.
 - Computing concealed-audio duration correctly across a `severe_outage` window took a fix:
   a full reconnect re-subscribes to a **new track SID** whose cumulative WebRTC counters
   reset to 0, so a naive "last value at window end minus last value at window start" diff
@@ -336,6 +341,15 @@ Three bugs surfaced building this, all fixed before trusting the numbers above:
   boundary happened to fall — not a real failure. Fixed by pairing turns across the full
   event stream and attributing each one to whichever window it *started* in, the same fix
   already applied to `concealed_samples` across a track-SID change.
+- That pairing then had to be bounded to the run. The data logs are append-only across
+  runs, so a turn left open at the end of one run stayed open and swallowed the *next*
+  run's first `response_published`, anchoring a real turn at a timestamp outside every
+  window of the run it belonged to. It cost the first profile of most runs one completed
+  turn — `clean` read 5 where 6 had actually happened. Reconnect and agent-drop pairing had
+  the same hole. The bound is the *next run's* start_ts from the manifest, not the current
+  run's own end_ts: `severe_outage` is the last profile in the suite and its agent recovery
+  lands 12–16s later, so the tighter bound reported "none recovered in-run" in three
+  recorded runs for a drop the agent demonstrably came back from.
 
 The VAD model is loaded once per worker process via `WorkerOptions(prewarm_fnc=...)`, not
 per track subscription. `silero.VAD.load()` is a blocking call whose own docstring points

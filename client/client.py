@@ -48,6 +48,13 @@ PUBLISH_AUDIO = os.getenv("PUBLISH_AUDIO", "false").lower() == "true"
 EVENT_LOG_PATH = os.getenv("EVENT_LOG_PATH", "/data/events.jsonl")
 AUDIO_STATS_POLL_SECONDS = float(os.getenv("AUDIO_STATS_POLL_SECONDS", "2"))
 RED_ENABLED = os.getenv("RED_ENABLED", "default").lower()
+if RED_ENABLED not in ("default", "true", "false"):
+    raise SystemExit(
+        f"RED_ENABLED must be one of default/true/false, got {RED_ENABLED!r}. "
+        "Failing loudly rather than falling through to the default: a typo here "
+        "would silently produce a RED-on run labelled as the RED-off arm of the "
+        "comparison, which is exactly the measurement the toggle exists for."
+    )
 SPEECH_PHRASE = os.getenv(
     "SPEECH_PHRASE", "Testing the LiveKit resilience kit, one two three four five."
 )
@@ -58,8 +65,14 @@ SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
 FRAME_MS = 10
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
-# Consecutive get_stats() failures before a track's stats poller gives up.
-MAX_STATS_POLL_FAILURES = 10
+# How long a track's stats poller keeps failing before it gives up, expressed in
+# SECONDS rather than as a poll count. A count silently couples the give-up
+# threshold to AUDIO_STATS_POLL_SECONDS: the previous "10 consecutive failures"
+# meant 20s at the default 2s interval, i.e. shorter than severe_outage's own
+# 25s blackout, so raising the poll interval to reduce log volume would have
+# made the poller abandon the track partway through the very fault it exists to
+# measure. Sixty seconds is comfortably longer than any profile's outage.
+STATS_POLL_GIVE_UP_SECONDS = 60.0
 
 
 # Opened once and line-buffered rather than reopened per event: the stats
@@ -225,12 +238,13 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
                 consecutive_failures,
                 exc_info=consecutive_failures == 1,
             )
-            if consecutive_failures >= MAX_STATS_POLL_FAILURES:
+            if consecutive_failures * AUDIO_STATS_POLL_SECONDS >= STATS_POLL_GIVE_UP_SECONDS:
                 log.error(
-                    "giving up stats polling for participant=%s sid=%s after %d consecutive failures",
+                    "giving up stats polling for participant=%s sid=%s after %d consecutive failures (%.0fs)",
                     participant.identity,
                     publication.sid,
                     consecutive_failures,
+                    consecutive_failures * AUDIO_STATS_POLL_SECONDS,
                 )
                 log_event(
                     "track_stats_abandoned",
@@ -271,6 +285,19 @@ def _on_publish_task_done(task: asyncio.Task) -> None:
 async def main() -> None:
     room = rtc.Room()
     stats_tasks: dict[str, asyncio.Task] = {}
+    # Pollers that have been cancelled but not yet awaited. A bare task.cancel()
+    # with nobody awaiting the result lets the task's own teardown race the loop
+    # shutting down -- the "Task was destroyed but it is pending!" failure the
+    # agent already guards against with _cancel_and_wait. Both the unsubscribe
+    # and the disconnect paths cancelled and then dropped the handle, so the
+    # only tasks the shutdown gather ever saw were the ones still live. Retiring
+    # them keeps every task reachable until it has actually been awaited.
+    retired_tasks: set[asyncio.Task] = set()
+
+    def retire(task: asyncio.Task) -> None:
+        task.cancel()
+        retired_tasks.add(task)
+        task.add_done_callback(retired_tasks.discard)
 
     @room.on("connection_state_changed")
     def on_connection_state_changed(state: rtc.ConnectionState) -> None:
@@ -340,12 +367,18 @@ async def main() -> None:
         log_event("track_unsubscribed", participant=participant.identity, sid=publication.sid)
         task = stats_tasks.pop(publication.sid, None)
         if task:
-            task.cancel()
+            retire(task)
 
     @room.on("disconnected")
     def on_disconnected(reason: object = None) -> None:
         log.warning("disconnected: reason=%s", reason)
         log_event("disconnected", reason=str(reason))
+        # A disconnect fires no track_unsubscribed for tracks that were still
+        # live, so without this a poller outlives the track it belongs to and
+        # keeps calling get_stats on it until the give-up threshold trips. The
+        # agent already did this on its own disconnect; the client did not.
+        for sid in list(stats_tasks):
+            retire(stats_tasks.pop(sid))
 
     log.info("connecting to %s as %s (room=%s, publish=%s)", LIVEKIT_URL, IDENTITY, ROOM_NAME, PUBLISH_AUDIO)
     connect_start = time.time()
@@ -370,7 +403,7 @@ async def main() -> None:
     try:
         await asyncio.Event().wait()
     finally:
-        pending = list(stats_tasks.values())
+        pending = list(stats_tasks.values()) + list(retired_tasks)
         if publish_task is not None:
             pending.append(publish_task)
         for task in pending:

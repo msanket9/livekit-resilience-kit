@@ -104,16 +104,28 @@ async def push_samples(source: rtc.AudioSource, samples: np.ndarray, on_first_fr
 
 async def watch_turns(
     identity: str,
+    source: str,
     vad: "silero.VAD",
     track: rtc.Track,
     response_source: rtc.AudioSource,
     response_tone: np.ndarray,
+    response_lock: asyncio.Lock,
 ) -> None:
     """Feed a subscribed audio track into local VAD and log turn boundaries.
 
     On END_OF_SPEECH, immediately publishes a synthetic response tone -- the
     stand-in for a real TTS reply -- and logs how long the caller waited for
     it.
+
+    One of these runs per subscribed audio track, and the agent auto-subscribes
+    to every audio track in the room. Today only client-a publishes, so there is
+    one. Two would have shared a single AudioSource with nothing serialising
+    them, interleaving two responses frame by frame into one corrupt stream, and
+    would have written turn events that named no speaker -- so the report could
+    not have told two speakers' turns apart. `response_lock` (shared across all
+    watchers) fixes the first; `source`, logged on every turn event, fixes the
+    second. Waiting on the lock is correctly inside the measured latency: a
+    caller queued behind another response really is waiting.
 
     `vad` is the prewarmed, process-wide model (see prewarm()), not one loaded
     here. VAD.load() is a blocking call -- its own docstring says to run it in
@@ -143,11 +155,11 @@ async def watch_turns(
     async def consume() -> None:
         async for event in vad_stream:
             if event.type.name == "START_OF_SPEECH":
-                log.info("speech_start")
-                log_event(identity, "speech_start")
+                log.info("speech_start: source=%s", source)
+                log_event(identity, "speech_start", source=source)
             elif event.type.name == "END_OF_SPEECH":
-                log.info("speech_end: duration=%.2fs", event.speech_duration)
-                log_event(identity, "speech_end", speech_duration=event.speech_duration)
+                log.info("speech_end: source=%s duration=%.2fs", source, event.speech_duration)
+                log_event(identity, "speech_end", source=source, speech_duration=event.speech_duration)
 
                 # The VAD only fires END_OF_SPEECH after holding
                 # min_silence_duration (0.55s by default) of silence, so by the
@@ -179,7 +191,8 @@ async def watch_turns(
                 def _mark_first_frame() -> None:
                     first_frame_ts["ts"] = time.time()
 
-                await push_samples(response_source, response_tone, on_first_frame=_mark_first_frame)
+                async with response_lock:
+                    await push_samples(response_source, response_tone, on_first_frame=_mark_first_frame)
                 response_latency_ms = (first_frame_ts["ts"] - speech_ended_at) * 1000
                 # The publish-side half on its own, kept so a regression in the
                 # agent's own code path stays visible separately from the VAD's
@@ -194,6 +207,7 @@ async def watch_turns(
                 log_event(
                     identity,
                     "response_published",
+                    source=source,
                     response_latency_ms=response_latency_ms,
                     publish_latency_ms=publish_latency_ms,
                     vad_silence_hold_ms=(event_consumed_at - speech_ended_at) * 1000,
@@ -271,6 +285,9 @@ async def entrypoint(ctx: JobContext) -> None:
         response_track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     )
     response_tone = make_response_tone()
+    # Shared by every watch_turns task so two subscribed tracks can never
+    # interleave their responses into this one AudioSource.
+    response_lock = asyncio.Lock()
     log.info("agent response track published")
 
     watch_tasks: dict[str, asyncio.Task] = {}
@@ -306,7 +323,15 @@ async def entrypoint(ctx: JobContext) -> None:
         log_event(identity, "track_subscribed", participant=participant.identity, sid=publication.sid)
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             watch_tasks[publication.sid] = asyncio.create_task(
-                watch_turns(identity, vad, track, response_source, response_tone)
+                watch_turns(
+                    identity,
+                    participant.identity,
+                    vad,
+                    track,
+                    response_source,
+                    response_tone,
+                    response_lock,
+                )
             )
 
     @ctx.room.on("track_unsubscribed")
@@ -320,6 +345,23 @@ async def entrypoint(ctx: JobContext) -> None:
         task = watch_tasks.pop(publication.sid, None)
         if task:
             _spawn_cleanup(task)
+
+    async def on_shutdown() -> None:
+        """Drain everything this job started, before the job goes away.
+
+        A worker process handles job after job, and nothing here was awaited at
+        job end: a job that ended without a `disconnected` (the ordinary case --
+        the room closes, or the worker is asked to drain) left its watch task,
+        and therefore its VAD stream, running into the next job. Cleanups
+        spawned on the way out were not awaited either, so their `finally`
+        blocks could race the loop shutting down -- the same "Task was destroyed
+        but it is pending!" failure _cancel_and_wait exists to prevent."""
+        for sid in list(watch_tasks):
+            _spawn_cleanup(watch_tasks.pop(sid))
+        if cleanup_tasks:
+            await asyncio.gather(*list(cleanup_tasks), return_exceptions=True)
+
+    ctx.add_shutdown_callback(on_shutdown)
 
 
 async def _cancel_and_wait(task: asyncio.Task) -> None:

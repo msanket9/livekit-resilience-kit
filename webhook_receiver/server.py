@@ -7,6 +7,7 @@ logs and fault-injection windows.
 import json
 import logging
 import os
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -26,6 +27,20 @@ LOG_PATH = os.getenv("WEBHOOK_LOG_PATH", "/data/webhooks.jsonl")
 PORT = int(os.getenv("PORT", "8080"))
 
 receiver = WebhookReceiver(TokenVerifier(API_KEY, API_SECRET))
+
+# Opened once and line-buffered, matching client.py and agent.py, rather than
+# reopened for every POST. `or "."` matters: os.path.dirname("webhooks.jsonl")
+# is the empty string and os.makedirs("") raises FileNotFoundError, so a
+# WEBHOOK_LOG_PATH with no directory component crashed the receiver at startup.
+# Both other loggers already guarded this; this one did not.
+#
+# The lock is not decoration. This is a ThreadingHTTPServer, so a burst of
+# webhooks -- which is exactly what a reconnect produces -- is handled on
+# several threads at once, and they would otherwise interleave writes into one
+# file object.
+os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
+_log_file = open(LOG_PATH, "a", buffering=1)
+_log_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,8 +73,18 @@ class Handler(BaseHTTPRequestHandler):
             "received_ts": time.time(),
             "event": MessageToDict(event, preserving_proto_field_name=True),
         }
-        with open(LOG_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        try:
+            with _log_lock:
+                _log_file.write(json.dumps(record) + "\n")
+        except Exception:
+            # Answering 200 for an event we failed to record would drop it
+            # silently. LiveKit retries a non-2xx delivery, and a retry carries
+            # the same event id, which the report generator deduplicates -- so
+            # asking for the retry is safe and is strictly better than losing
+            # the event.
+            log.exception("failed to write webhook event to %s", LOG_PATH)
+            self._respond(500, b"log write failed")
+            return
 
         log.info("logged webhook event: %s", record["event"].get("event"))
         self._respond(200, b"ok")
@@ -72,6 +97,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     log.info("webhook receiver listening on :%d, logging to %s", PORT, LOG_PATH)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
