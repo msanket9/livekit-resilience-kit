@@ -33,5 +33,15 @@ docker run --rm \
     "${DOWNLINK_CONTAINER}" &
 DOWNLINK_PID=$!
 
-wait "${UPLINK_PID}" "${DOWNLINK_PID}"
+uplink_status=0
+downlink_status=0
+wait "${UPLINK_PID}" || uplink_status=$?
+wait "${DOWNLINK_PID}" || downlink_status=$?
+# `wait pid1 pid2` only reports the LAST-listed job's exit status in bash --
+# waiting on each separately so a failed uplink shaping command doesn't get
+# silently masked by a successful downlink one (or vice versa).
+if [ "${uplink_status}" -ne 0 ] || [ "${downlink_status}" -ne 0 ]; then
+  echo "!! rural_4g: uplink_status=${uplink_status} downlink_status=${downlink_status}" >&2
+  exit 1
+fi
 echo "== Rural 4G profile done =="

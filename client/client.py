@@ -1,6 +1,6 @@
-"""Minimal LiveKit test client: joins a room, optionally publishes a synthetic
-sine-tone audio track, and logs connection/track/quality/freeze events both
-to stdout and as structured JSON lines for later analysis.
+"""Minimal LiveKit test client: joins a room, optionally publishes a looped
+speech-like utterance (via espeak-ng), and logs connection/track/quality/freeze
+events both to stdout and as structured JSON lines for later analysis.
 
 Configured entirely via environment variables so the same image can play the
 publisher or subscriber persona in docker-compose:
@@ -10,19 +10,25 @@ publisher or subscriber persona in docker-compose:
   LIVEKIT_API_SECRET   default: secret
   ROOM_NAME            default: resilience-test
   PARTICIPANT_IDENTITY required
-  PUBLISH_AUDIO        "true" to publish a sine-tone track, otherwise subscribe-only
+  PUBLISH_AUDIO        "true" to publish the speech loop, otherwise subscribe-only
   EVENT_LOG_PATH          where to append JSON-line events (default: /data/events.jsonl)
   AUDIO_STATS_POLL_SECONDS  how often to poll subscribed-audio freeze/concealment stats (default: 2)
   RED_ENABLED             "default" (leave LiveKit's own default, which is enabled), "true",
                            or "false" -- lets a suite run compare concealment with RED forced
                            off against the baseline
+  SPEECH_PHRASE           utterance to speak on loop (default: a short test phrase)
+  PAUSE_SECONDS           silence between utterances, giving a subscriber's VAD real
+                           speech boundaries to detect (default: 2)
 """
 
 import asyncio
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import time
+import wave
 
 import numpy as np
 from livekit import api, rtc
@@ -42,12 +48,16 @@ PUBLISH_AUDIO = os.getenv("PUBLISH_AUDIO", "false").lower() == "true"
 EVENT_LOG_PATH = os.getenv("EVENT_LOG_PATH", "/data/events.jsonl")
 AUDIO_STATS_POLL_SECONDS = float(os.getenv("AUDIO_STATS_POLL_SECONDS", "2"))
 RED_ENABLED = os.getenv("RED_ENABLED", "default").lower()
+SPEECH_PHRASE = os.getenv(
+    "SPEECH_PHRASE", "Testing the LiveKit resilience kit, one two three four five."
+)
+PAUSE_SECONDS = float(os.getenv("PAUSE_SECONDS", "2"))
+ESPEAK_RATE_WPM = int(os.getenv("ESPEAK_RATE_WPM", "150"))
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
 FRAME_MS = 10
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
-TONE_HZ = 440
 
 
 def log_event(event: str, **fields) -> None:
@@ -67,25 +77,67 @@ def make_token() -> str:
     )
 
 
-async def publish_sine_tone(room: rtc.Room) -> None:
+def synthesize_speech(phrase: str) -> np.ndarray:
+    """Generate a short utterance with espeak-ng (fully offline, no API key
+    or model download) and resample it to SAMPLE_RATE.
+
+    A continuous tone doesn't register as speech to a voice-activity
+    detector -- verified directly: 3s of a pure 440Hz tone through Silero
+    VAD never crossed a 0.005 speech probability (activation threshold is
+    0.5), while a real espeak-ng utterance hit 0.95+ immediately. Real
+    speech-shaped audio is what gives a subscriber's VAD actual utterance
+    boundaries to detect.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+        subprocess.run(
+            ["espeak-ng", "-s", str(ESPEAK_RATE_WPM), "-w", tmp.name, phrase],
+            check=True,
+            capture_output=True,
+        )
+        with wave.open(tmp.name, "rb") as w:
+            raw = w.readframes(w.getnframes())
+            src_rate = w.getframerate()
+
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+    if src_rate == SAMPLE_RATE:
+        return samples.astype(np.int16)
+    n_target = int(len(samples) * SAMPLE_RATE / src_rate)
+    resampled = np.interp(
+        np.linspace(0, len(samples), n_target, endpoint=False),
+        np.arange(len(samples)),
+        samples,
+    )
+    return resampled.astype(np.int16)
+
+
+async def publish_speech_loop(room: rtc.Room) -> None:
     source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
-    track = rtc.LocalAudioTrack.create_audio_track("sine-tone", source)
+    track = rtc.LocalAudioTrack.create_audio_track("speech-loop", source)
     options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     if RED_ENABLED in ("true", "false"):
         options.red = RED_ENABLED == "true"
     await room.local_participant.publish_track(track, options)
-    log.info("published sine-tone audio track (red=%s)", RED_ENABLED)
+    log.info("published speech-loop audio track (red=%s)", RED_ENABLED)
 
-    phase = 0.0
-    phase_step = 2 * np.pi * TONE_HZ / SAMPLE_RATE
+    utterance = synthesize_speech(SPEECH_PHRASE)
+    silence = np.zeros(int(SAMPLE_RATE * PAUSE_SECONDS), dtype=np.int16)
+    loop_samples = np.concatenate([utterance, silence])
+    log.info(
+        "speech loop ready: utterance=%.1fs pause=%.1fs phrase=%r",
+        len(utterance) / SAMPLE_RATE,
+        PAUSE_SECONDS,
+        SPEECH_PHRASE,
+    )
+
     while True:
-        frame = rtc.AudioFrame.create(SAMPLE_RATE, NUM_CHANNELS, SAMPLES_PER_FRAME)
-        samples = np.frombuffer(frame.data, dtype=np.int16)
-        t = phase + phase_step * np.arange(SAMPLES_PER_FRAME)
-        samples[:] = (np.sin(t) * 8000).astype(np.int16)
-        phase = t[-1] + phase_step
-        await source.capture_frame(frame)
-        await asyncio.sleep(FRAME_MS / 1000)
+        for i in range(0, len(loop_samples), SAMPLES_PER_FRAME):
+            chunk = loop_samples[i : i + SAMPLES_PER_FRAME]
+            frame = rtc.AudioFrame.create(SAMPLE_RATE, NUM_CHANNELS, SAMPLES_PER_FRAME)
+            fsamples = np.frombuffer(frame.data, dtype=np.int16)
+            fsamples[: len(chunk)] = chunk
+            fsamples[len(chunk) :] = 0
+            await source.capture_frame(frame)
+            await asyncio.sleep(FRAME_MS / 1000)
 
 
 async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant) -> None:
@@ -216,7 +268,7 @@ async def main() -> None:
     log_event("connected", room=room.name, time_to_first_connect_ms=time_to_first_connect_ms)
 
     if PUBLISH_AUDIO:
-        asyncio.create_task(publish_sine_tone(room))
+        asyncio.create_task(publish_speech_loop(room))
 
     # Keep the client alive to observe events / faults.
     await asyncio.Event().wait()

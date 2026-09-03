@@ -30,7 +30,10 @@ services:
     build: ./client
     container_name: client-a
     depends_on:
-      - livekit-server
+      livekit-server:
+        condition: service_started
+      agent:
+        condition: service_healthy
     environment:
       LIVEKIT_URL: ws://livekit-server:7880
       LIVEKIT_API_KEY: devkey
@@ -49,7 +52,10 @@ services:
     build: ./client
     container_name: client-b
     depends_on:
-      - livekit-server
+      livekit-server:
+        condition: service_started
+      agent:
+        condition: service_healthy
     environment:
       LIVEKIT_URL: ws://livekit-server:7880
       LIVEKIT_API_KEY: devkey
@@ -62,6 +68,32 @@ services:
       - ./data:/data
     networks:
       - resilience-net
+
+  agent:
+    build: ./agent
+    container_name: agent
+    depends_on:
+      - livekit-server
+    environment:
+      LIVEKIT_URL: ws://livekit-server:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      EVENT_LOG_PATH: /data/agent-events.jsonl
+    volumes:
+      - ./data:/data
+    networks:
+      - resilience-net
+    healthcheck:
+      # the worker's HTTP server comes up slightly before it finishes
+      # registering with the LiveKit server for automatic dispatch; clients
+      # wait on this so they don't create the room before the agent can be
+      # dispatched into it (dispatch is a room-creation-time event -- a
+      # worker that registers after the room already exists never gets it)
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
 
 networks:
   resilience-net:

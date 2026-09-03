@@ -30,11 +30,19 @@ for profile in "${PROFILES[@]}"; do
   echo "-- profile: ${profile} --"
   start_ts="$(now)"
   if [ "${profile}" = "clean" ]; then
-    "${script}" "${DURATION_SECONDS}"
+    profile_ok=1; "${script}" "${DURATION_SECONDS}" || profile_ok=0
   else
-    "${script}" "${TARGET_CONTAINER}" "${DURATION_SECONDS}"
+    profile_ok=1; "${script}" "${TARGET_CONTAINER}" "${DURATION_SECONDS}" || profile_ok=0
   fi
   end_ts="$(now)"
+
+  if [ "${profile_ok}" -eq 0 ]; then
+    # e.g. severe_outage needs DURATION_SECONDS greater than its own outage
+    # window -- one profile failing (bad params, transient docker/pumba
+    # error) shouldn't lose the rest of the suite or its manifest entries.
+    echo "!! profile ${profile} failed -- skipping, rest of the suite continues" >&2
+    continue
+  fi
 
   python3 -c "
 import json

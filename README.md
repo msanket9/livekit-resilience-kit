@@ -4,6 +4,17 @@
 conditions — packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect —
 not just under scale.
 
+- [Why this exists](#why-this-exists)
+- [Requirements](#requirements)
+- [Quickstart](#quickstart)
+- [Repo layout](#repo-layout)
+- [Fault profiles](#fault-profiles)
+- [Metrics capture](#metrics-capture)
+- [Running the full suite + report](#running-the-full-suite--report)
+- [Measuring RED's actual effect](#measuring-reds-actual-effect)
+- [Agent leg](#agent-leg)
+- [Status](#status)
+
 ## Why this exists
 
 LiveKit's own tooling (`lk load-test`, `lk perf agent-load-test`) tests **scale**: how many
@@ -39,22 +50,39 @@ deliberately breaks the network to confirm those mechanisms actually hold up in 
 (their GitHub org's own testing tools — `livekit-cli`'s load-tester and `chrometester` — are
 both scale-oriented, not fault-injection). That's the gap this fills.
 
-## Local stack
+## Requirements
 
-Brings up a local LiveKit server (dev mode) plus two containerized Python clients
-(`client-a` publishes a synthetic sine-tone audio track, `client-b` subscribes to it).
+- Docker + Docker Compose (this was built and tested against Docker 29 / Compose v5)
+- Python 3.12+ on the host, stdlib only — `scripts/generate_report.py` and the fault
+  scripts don't need a virtualenv or any pip installs
+- Everything else (LiveKit server, Pumba, the Python clients) runs in containers
 
-```bash
-docker compose up --build
-```
-
-Watch `client-a` log a published track and `client-b` log `track_subscribed`.
+## Quickstart
 
 ```bash
+docker compose up --build -d                # LiveKit server + webhook receiver + client-a (publisher) + client-b (subscriber) + agent
+./scripts/run_test_suite.sh                  # runs every fault profile back-to-back, ~5 min at the defaults
+python3 scripts/generate_report.py           # writes reports/report-<run_id>.{json,md,html} -- open the .html in a browser
 docker compose down
 ```
 
-## Fault injection
+That's the whole loop: bring the stack up, run the suite, read the report. Everything
+below is what each piece actually does and the real findings from running it.
+
+## Repo layout
+
+```
+client/            Python LiveKit client (publisher or subscriber persona, by env var)
+agent/               synthetic LiveKit Agent -- local VAD turn detection + synthetic response
+webhook_receiver/   verifies + logs LiveKit server webhooks
+config/livekit.yaml  local dev-mode server config (devkey/secret, webhook target)
+faults/             one Pumba-driven fault-profile script per scenario
+scripts/             run_test_suite.sh (orchestrator), generate_report.py, one-off smoke/verify scripts
+data/                JSONL event/webhook logs + the run manifest (gitignored, generated)
+reports/             generated report-<run_id>.{json,md,html} (gitignored, generated)
+```
+
+## Fault profiles
 
 Network faults are injected with [Pumba](https://github.com/alexei-led/pumba) against a
 running client container. Each profile in [`faults/`](faults/) is a standalone script:
@@ -115,25 +143,27 @@ comparison:
 python3 scripts/generate_report.py   # writes reports/report-<run_id>.{json,md,html}
 ```
 
-Sample output:
+Sample output (all five profiles, one run, agent attached — full table, scroll right in the
+`.html` version for the agent columns):
 
-| Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio |
-|---|---|---|---|---|---|
-| clean | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 1.45s |
-| rural_4g | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.15s |
-| gateway_dropout | 45s | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 3.91s |
-| congested_wifi | 45s | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s |
-| severe_outage | 45s | 66.7% / 0% / 0% / 33.3% | 1 | 18.48s | 19.3s |
+| Profile | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio | Agent turns (ok/failed) | Avg turn length |
+|---|---|---|---|---|---|---|
+| clean | 100.0% / 0% / 0% / 0% | 0 | — | 0.05s | 5/0 | 4.74s |
+| rural_4g | 100.0% / 0% / 0% / 0% | 0 | — | 0.18s | 7/0 | 4.53s |
+| gateway_dropout | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 3.98s | 6/0 | 4.74s |
+| congested_wifi | 100.0% / 0% / 0% / 0% | 0 | — | 0.01s | 6/0 | 4.59s |
+| severe_outage | 66.7% / 0% / 0% / 33.3% | 1 | 16.86s | 19.98s | 1/3 | 4.51s |
 
 A few things worth noting in that data:
 
 - A short ~4s `gateway_dropout` never trips LiveKit's client-side reconnect logic (0
   reconnects) — it only shows up as a connection-quality dip and concealed audio. It took a
   continuous 25s outage (`severe_outage`) to actually force a `reconnecting` → `reconnected`
-  cycle, which then took ~18.5s to recover — real numbers for a mechanism LiveKit ships but
-  doesn't otherwise expose.
+  cycle, which then took ~17s to recover — real numbers for a mechanism LiveKit ships but
+  doesn't otherwise expose. That same outage is also the only profile where the agent's
+  turn detection actually fails (1 ok / 3 failed) — see [Agent leg](#agent-leg).
 - `concealed_samples` is a more sensitive signal than the connection-quality label for
-  milder profiles: `rural_4g` shows measurable concealed audio (0.15s) while its quality
+  milder profiles: `rural_4g` shows measurable concealed audio (0.18s) while its quality
   label stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
   scorer excluding jitter/RTT from its score (see "Why this exists" above).
 - Computing concealed-audio duration correctly across a `severe_outage` window took a fix:
@@ -175,3 +205,78 @@ RED cut concealed audio by roughly 8x under identical injected loss/jitter/bandw
 kept `ConnectionQuality` steady at "Excellent" instead of dropping half the time to "Good."
 The vendor claim holds up — and now there's a measured number behind it instead of just a
 blog post.
+
+## Agent leg
+
+The `agent` service is a **real** `livekit-agents` worker — automatic dispatch, same
+`JobContext`/room API a production agent uses — but it is explicitly **not a
+conversational agent**. It stands in for an STT→LLM→TTS pipeline using:
+
+- **Turn detection**: local Silero VAD (`livekit-plugins-silero`), fully offline, no API
+  key.
+- **"Response"**: a synthetic tone published the instant end-of-speech is detected, in
+  place of a real TTS reply.
+
+This exists because the original plan (dispatch a real agent, measure response latency and
+turn-taking under faults) was blocked on STT/LLM/TTS provider API keys nobody had supplied
+yet — so it's built to measure exactly what the brief asked for (response latency,
+turn-taking failures, recovery after a drop) without needing any of them. Swapping in real
+STT/LLM/TTS plugins later is a drop-in change to `agent/agent.py`, not a redesign.
+
+Two things had to be verified empirically before this worked at all, not assumed:
+
+1. **A continuous tone isn't speech.** `client-a` originally published a continuous 440Hz
+   sine wave (used for every earlier metric in this README) — fed through real Silero VAD,
+   its speech probability never exceeded 0.005 (activation threshold is 0.5). A voice
+   activity detector correctly refuses to treat a pure tone as speech, so the agent would
+   never have anything to detect. Fixed by having `client-a` speak a short phrase with
+   `espeak-ng` (fully offline, no API key) on a loop with pauses between — verified that
+   *this* correctly drives VAD probability to 0.95+ immediately.
+2. **Automatic dispatch is a room-creation-time event.** The agent worker takes a couple
+   seconds to register with the LiveKit server after its container starts (plugin
+   preload, ONNX init). If a client creates the room before that finishes, the agent never
+   gets dispatched into it — dispatch doesn't retroactively fire for a worker that
+   registers late. Fixed with a Compose healthcheck on the agent's worker HTTP port, gating
+   `client-a`/`client-b` on `condition: service_healthy` so the room is never created before
+   the agent can be dispatched into it.
+
+Real measured result from the table above: every profile completes all its turns cleanly
+(0 failures) **except** `severe_outage`, which fails 3 of 4 (VAD never gets the frames to
+detect end-of-speech during a 25s blackout — a genuine turn-taking failure, not a fault in
+the harness). A separate, more tightly-timed `gateway_dropout` run (interval=15s instead of
+the default 45s, so multiple dropouts land clearly mid-window instead of once at a profile
+boundary) shows the *other* failure mode: turns don't fail, but get truncated —
+
+| Profile | Agent turns (ok/failed) | Avg turn length | Concealed audio |
+|---|---|---|---|
+| clean | 6/0 | 4.24s | 0.02s |
+| gateway_dropout (interval=15s) | 5/0 | 3.28s | 12.47s |
+
+— a real utterance the agent should hear as one continuous turn gets cut short mid-sentence
+when frames stop arriving partway through it. Response latency itself stayed flat across
+every profile (sub-millisecond) — expected, since this synthetic agent's "response" is
+locally generated and doesn't depend on receiving anything back over the network; the
+network-sensitive signals here are turn completion and turn length, not response latency.
+
+Two bugs surfaced building this, both fixed before trusting the numbers above:
+- The first version measured "response latency" as time-to-*finish-playing* the whole 1s
+  response tone (always ≥1000ms) instead of time-to-*first-frame-pushed*. Fixed by timing
+  the first frame specifically.
+- A turn that starts in one profile's window but completes a moment into the next one was
+  originally counted as a failure in the first window, purely because of where the fault
+  boundary happened to fall — not a real failure. Fixed by pairing turns across the full
+  event stream and attributing each one to whichever window it *started* in, the same fix
+  already applied to `concealed_samples` across a track-SID change.
+
+## Status
+
+Done: local stack, all five fault profiles (verified against real ping/iperf3
+measurements, not just their config), client + webhook metrics capture, the run
+orchestrator and report generator, the RED on/off comparison, and the synthetic agent leg
+above.
+
+Not done: swapping the synthetic agent's local VAD + synthetic-tone stand-in for real
+STT/LLM/TTS plugins — a drop-in change once API keys are available, not a redesign. Video
+testing, multi-region testing, and Prometheus/Grafana export are explicitly out of scope
+for this version (audio-only, single-machine, JSON/HTML reports are enough to prove the
+concept).

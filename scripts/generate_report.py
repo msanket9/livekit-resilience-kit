@@ -102,9 +102,18 @@ def _sid_delta(events_for_sid, start_ts, end_ts, field):
     return max(0, relevant[-1].get(field, 0) - baseline)
 
 
-def concealment_stats(client_b_events, start_ts, end_ts):
-    """Sum of concealed-sample deltas within [start_ts, end_ts], computed
-    per subscribed-track-sid and summed across sids.
+def concealment_stats(client_b_events, start_ts, end_ts, participant="client-a"):
+    """Sum of concealed-sample deltas within [start_ts, end_ts] for one
+    participant's track, computed per subscribed-track-sid and summed
+    across sids.
+
+    Since the agent leg was added, client-b subscribes to TWO audio tracks
+    (client-a's speech and the agent's response tone) and polls track_stats
+    on both. Filtering to participant="client-a" matters: rural_4g shapes
+    livekit-server's own egress (its downlink-cap half), which affects every
+    track relayed through the server -- including the agent's response
+    track -- so an unfiltered sum would silently blend concealment from a
+    track that isn't the one this metric is meant to measure.
 
     A full LiveKit reconnect re-subscribes to a NEW track sid whose
     cumulative WebRTC counters reset to 0. Naively diffing "last value at
@@ -112,7 +121,9 @@ def concealment_stats(client_b_events, start_ts, end_ts):
     and gets clamped to 0 -- silently hiding real concealment that happened
     on the old track right before it was torn down. Diffing per-sid and
     summing avoids that."""
-    stats_events = [e for e in client_b_events if e["event"] == "track_stats"]
+    stats_events = [
+        e for e in client_b_events if e["event"] == "track_stats" and e.get("participant") == participant
+    ]
     by_sid = defaultdict(list)
     for e in stats_events:
         by_sid[e["track_sid"]].append(e)
@@ -130,6 +141,68 @@ def concealment_stats(client_b_events, start_ts, end_ts):
     }
 
 
+def _pair_agent_turns(agent_events):
+    """Pairs speech_start -> speech_end -> response_published across the
+    FULL event stream, tagging each turn with its speech_start timestamp.
+
+    Deliberately NOT window-restricted: a turn that starts just before a
+    fault profile's window ends and completes a moment later (a real,
+    successful turn) must not be counted as failed just because a profile
+    boundary happened to fall in the middle of it -- the same class of
+    boundary-truncation bug already hit and fixed for concealed_samples
+    across a track-SID change. Pairing over the whole stream and filtering
+    by start_ts afterward avoids it."""
+    events = sorted(agent_events, key=lambda e: e["ts"])
+    turns = []
+    open_start = None
+    open_duration = None
+    for e in events:
+        if e["event"] == "speech_start":
+            if open_start is not None:
+                turns.append({"start_ts": open_start, "duration": open_duration, "latency_ms": None})
+            open_start = e["ts"]
+            open_duration = None
+        elif e["event"] == "speech_end" and open_start is not None:
+            open_duration = e.get("speech_duration")
+        elif e["event"] == "response_published" and open_start is not None:
+            turns.append(
+                {"start_ts": open_start, "duration": open_duration, "latency_ms": e.get("response_latency_ms")}
+            )
+            open_start = None
+            open_duration = None
+    if open_start is not None:
+        turns.append({"start_ts": open_start, "duration": open_duration, "latency_ms": None})
+    return turns
+
+
+def agent_stats(agent_events, start_ts, end_ts):
+    """A turn belongs to a profile window if it STARTED within
+    [start_ts, end_ts], regardless of when it completed. A turn only counts
+    as completed once speech_start -> speech_end -> response_published all
+    land -- one that never gets a response_published (VAD never detected
+    end-of-speech, or a new speech_start interrupted it first) is a genuine
+    turn-taking failure.
+
+    avg_speech_duration_s is worth watching on its own, not just
+    success/failure: under packet loss the VAD can still complete a turn but
+    detect a truncated one -- a real utterance the agent should have heard
+    as one continuous turn gets cut short mid-sentence when frames stop
+    arriving mid-utterance. That shows up as a lower average duration during
+    a fault window, not as a failed/unmatched turn."""
+    turns = [t for t in _pair_agent_turns(agent_events) if start_ts <= t["start_ts"] <= end_ts]
+    completed = [t for t in turns if t["latency_ms"] is not None]
+    durations = [t["duration"] for t in completed if t["duration"] is not None]
+    return {
+        "turns_detected": len(turns),
+        "turns_completed": len(completed),
+        "turns_failed": len(turns) - len(completed),
+        "avg_speech_duration_s": round(sum(durations) / len(durations), 2) if durations else None,
+        "avg_response_latency_ms": round(sum(t["latency_ms"] for t in completed) / len(completed), 2)
+        if completed
+        else None,
+    }
+
+
 def time_to_first_connect(events_by_client):
     result = {}
     for identity, events in events_by_client.items():
@@ -140,7 +213,7 @@ def time_to_first_connect(events_by_client):
     return result
 
 
-def build_summary(run_id, manifest_entries, client_a_events, client_b_events):
+def build_summary(run_id, manifest_entries, client_a_events, client_b_events, agent_events):
     profiles = []
     for entry in sorted(manifest_entries, key=lambda e: e["start_ts"]):
         start_ts, end_ts = entry["start_ts"], entry["end_ts"]
@@ -153,6 +226,7 @@ def build_summary(run_id, manifest_entries, client_a_events, client_b_events):
                 "quality": quality_distribution(client_b_events, start_ts, end_ts),
                 "reconnects": reconnect_stats(client_a_events, start_ts, end_ts),
                 "concealment": concealment_stats(client_b_events, start_ts, end_ts),
+                "agent": agent_stats(agent_events, start_ts, end_ts),
             }
         )
     return {
@@ -169,16 +243,24 @@ def render_markdown(summary):
     ttfc = summary["time_to_first_connect_ms"]
     lines.append("**Time to first connect:** " + ", ".join(f"{k}={v}ms" for k, v in ttfc.items()))
     lines.append("")
-    lines.append("| Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append(
+        "| Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | "
+        "Concealed audio | Agent turns (ok/failed) | Avg turn length | Avg response latency |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for p in summary["profiles"]:
         pct = p["quality"]["percent"]
         quality_str = " / ".join(f"{pct.get(k, 0)}%" for k in ("EXCELLENT", "GOOD", "POOR", "LOST"))
         rc = p["reconnects"]
         recovery = f"{rc['avg_recovery_time_s']}s" if rc["avg_recovery_time_s"] is not None else "—"
         concealed = f"{p['concealment']['concealed_seconds_approx']}s"
+        ag = p["agent"]
+        turns = f"{ag['turns_completed']}/{ag['turns_failed']}"
+        turn_len = f"{ag['avg_speech_duration_s']}s" if ag["avg_speech_duration_s"] is not None else "—"
+        latency = f"{ag['avg_response_latency_ms']}ms" if ag["avg_response_latency_ms"] is not None else "—"
         lines.append(
-            f"| {p['profile']} | {p['duration_s']}s | {quality_str} | {rc['reconnect_count']} | {recovery} | {concealed} |"
+            f"| {p['profile']} | {p['duration_s']}s | {quality_str} | {rc['reconnect_count']} | {recovery} | "
+            f"{concealed} | {turns} | {turn_len} | {latency} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -193,6 +275,10 @@ def render_html(summary):
         rc = p["reconnects"]
         recovery = f"{rc['avg_recovery_time_s']}s" if rc["avg_recovery_time_s"] is not None else "—"
         concealed = f"{p['concealment']['concealed_seconds_approx']}s"
+        ag = p["agent"]
+        turns = f"{ag['turns_completed']}/{ag['turns_failed']}"
+        turn_len = f"{ag['avg_speech_duration_s']}s" if ag["avg_speech_duration_s"] is not None else "—"
+        latency = f"{ag['avg_response_latency_ms']}ms" if ag["avg_response_latency_ms"] is not None else "—"
         rows.append(
             f"""
         <tr>
@@ -202,6 +288,9 @@ def render_html(summary):
           <td>{rc['reconnect_count']}</td>
           <td>{recovery}</td>
           <td>{concealed}</td>
+          <td>{turns}</td>
+          <td>{turn_len}</td>
+          <td>{latency}</td>
         </tr>"""
         )
     return f"""<!doctype html>
@@ -212,7 +301,8 @@ def render_html(summary):
 <style>
   body {{ font-family: -apple-system, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }}
   h1 {{ font-size: 1.3rem; }}
-  table {{ border-collapse: collapse; margin-top: 1rem; background: white; }}
+  .table-scroll {{ overflow-x: auto; margin-top: 1rem; }}
+  table {{ border-collapse: collapse; background: white; white-space: nowrap; }}
   th, td {{ border: 1px solid #ddd; padding: 0.5rem 0.8rem; text-align: left; }}
   th {{ background: #f0f0f0; }}
   tr:nth-child(even) {{ background: #f9f9f9; }}
@@ -222,10 +312,16 @@ def render_html(summary):
 <body>
   <h1>LiveKit Resilience Report — run {summary['run_id']}</h1>
   <p class="meta">Time to first connect: {ttfc_str}</p>
+  <div class="table-scroll">
   <table>
-    <tr><th>Profile</th><th>Duration</th><th>Quality (Excellent/Good/Poor/Lost)</th><th>Reconnects</th><th>Avg recovery</th><th>Concealed audio</th></tr>
+    <tr>
+      <th>Profile</th><th>Duration</th><th>Quality (Excellent/Good/Poor/Lost)</th><th>Reconnects</th>
+      <th>Avg recovery</th><th>Concealed audio</th><th>Agent turns (ok/failed)</th>
+      <th>Avg turn length</th><th>Avg response latency</th>
+    </tr>
     {''.join(rows)}
   </table>
+  </div>
 </body>
 </html>
 """
@@ -243,8 +339,9 @@ def main():
 
     client_a_events = read_jsonl(os.path.join(args.data_dir, "client-a-events.jsonl"))
     client_b_events = read_jsonl(os.path.join(args.data_dir, "client-b-events.jsonl"))
+    agent_events = read_jsonl(os.path.join(args.data_dir, "agent-events.jsonl"))
 
-    summary = build_summary(run_id, manifest_entries, client_a_events, client_b_events)
+    summary = build_summary(run_id, manifest_entries, client_a_events, client_b_events, agent_events)
 
     os.makedirs(args.out_dir, exist_ok=True)
     json_path = os.path.join(args.out_dir, f"report-{run_id}.json")
