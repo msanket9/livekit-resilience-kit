@@ -14,8 +14,22 @@ DURATION_SECONDS="${2:-60}"
 DOWNLINK_CONTAINER="${3:-livekit-server}"
 DURATION="${DURATION_SECONDS}s"
 
+UPLINK_NAME="pumba-rural4g-up-$$"
+DOWNLINK_NAME="pumba-rural4g-down-$$"
+
+# Pumba restores the netem rules it applied when it receives SIGTERM, so the
+# cleanup is `docker stop`, not `docker kill`. Without this trap an interrupted
+# run leaves BOTH qdiscs applied -- and this profile shapes livekit-server as
+# well as the client, so a leaked downlink cap degrades every participant in
+# every later run until the containers are recreated.
+cleanup() {
+  docker stop "${UPLINK_NAME}" "${DOWNLINK_NAME}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
 echo "== Rural 4G: uplink shaping (loss+jitter+2Mbps) on ${UPLINK_CONTAINER} for ${DURATION} =="
 docker run --rm \
+  --name "${UPLINK_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   gaiaadm/pumba \
   netem --duration "${DURATION}" combine \
@@ -27,6 +41,7 @@ UPLINK_PID=$!
 
 echo "== Rural 4G: downlink cap (5Mbps) on ${DOWNLINK_CONTAINER} for ${DURATION} =="
 docker run --rm \
+  --name "${DOWNLINK_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   gaiaadm/pumba \
   netem --duration "${DURATION}" rate --rate 5mbit \

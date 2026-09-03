@@ -1,3 +1,6 @@
-livekit>=0.19
-livekit-api>=0.7
-numpy>=1.26
+# Pinned exactly: this kit's output is measurements, and an unpinned `>=` means
+# a rebuild months from now silently compares numbers produced by a different
+# WebRTC stack. Versions below are the ones the working images resolved to.
+livekit==1.1.17
+livekit-api==1.2.1
+numpy==2.5.2

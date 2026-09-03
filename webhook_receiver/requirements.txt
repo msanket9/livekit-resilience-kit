@@ -1,1 +1,2 @@
-livekit-api>=0.7
+# Pinned exactly -- see client/requirements.txt for why.
+livekit-api==1.2.1

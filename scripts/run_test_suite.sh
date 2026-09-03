@@ -11,13 +11,51 @@ MANIFEST="${DATA_DIR}/run_manifest.jsonl"
 
 TARGET_CONTAINER="${TARGET_CONTAINER:-client-a}"
 DURATION_SECONDS="${DURATION_SECONDS:-60}"
+# Quiet gap between profiles, outside every measured window. Profiles used to
+# run truly back-to-back, which let one profile's tail bleed into the next
+# one's head: LiveKit's bandwidth estimator ramps back up over seconds, the
+# subscriber's jitter buffer is still draining, and a track torn down at the
+# end of a fault may not be resubscribed yet. All of that landed inside the
+# next profile's numbers and was attributed to the next profile's fault.
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-10}"
 # shellcheck disable=SC2206
 PROFILES=(${PROFILES:-clean rural_4g gateway_dropout congested_wifi severe_outage})
 
 now() { python3 -c "import time; print(time.time())"; }
 
+CURRENT_FAULT_PID=""
+INTERRUPTED=0
+
+# Each fault script traps its own signals and restores the netem rules it
+# applied. That covers Ctrl-C, which the terminal delivers to the whole process
+# group. It does NOT cover a SIGTERM delivered to this script alone -- verified:
+# killing the suite that way left two pumba containers running and 166ms of
+# injected latency still applied to client-a, which would then silently degrade
+# every later run. So the suite forwards the signal to the fault script it is
+# currently waiting on, and sweeps any container that outlived its parent.
+suite_cleanup() {
+  if [ -n "${CURRENT_FAULT_PID}" ]; then
+    kill -TERM "${CURRENT_FAULT_PID}" 2>/dev/null || true
+    wait "${CURRENT_FAULT_PID}" 2>/dev/null || true
+    CURRENT_FAULT_PID=""
+  fi
+  if [ "${INTERRUPTED}" -eq 1 ]; then
+    leftover="$(docker ps -q --filter 'name=^pumba-' 2>/dev/null || true)"
+    if [ -n "${leftover}" ]; then
+      echo "!! stopping pumba container(s) that outlived their fault script" >&2
+      # shellcheck disable=SC2086
+      docker stop ${leftover} >/dev/null 2>&1 || true
+    fi
+  fi
+}
+on_signal() { INTERRUPTED=1; suite_cleanup; exit 130; }
+trap suite_cleanup EXIT
+trap on_signal INT TERM
+
 RUN_ID="$(python3 -c "import time; print(int(time.time()))")"
-echo "== Run suite: run_id=${RUN_ID} profiles=[${PROFILES[*]}] duration=${DURATION_SECONDS}s each, target=${TARGET_CONTAINER} =="
+echo "== Run suite: run_id=${RUN_ID} profiles=[${PROFILES[*]}] duration=${DURATION_SECONDS}s each, cooldown=${COOLDOWN_SECONDS}s, target=${TARGET_CONTAINER} =="
+
+first_profile=1
 
 for profile in "${PROFILES[@]}"; do
   script="${FAULTS_DIR}/${profile}.sh"
@@ -26,14 +64,27 @@ for profile in "${PROFILES[@]}"; do
     continue
   fi
 
+  if [ "${first_profile}" -eq 0 ] && [ "${COOLDOWN_SECONDS}" -gt 0 ]; then
+    echo "-- cooldown ${COOLDOWN_SECONDS}s (not measured) --"
+    sleep "${COOLDOWN_SECONDS}"
+  fi
+  first_profile=0
+
   echo
   echo "-- profile: ${profile} --"
   start_ts="$(now)"
+  # Backgrounded so the suite keeps its own PID for the running fault script and
+  # can forward a signal to it (see suite_cleanup); `wait` still makes this
+  # sequential, exactly as before.
   if [ "${profile}" = "clean" ]; then
-    profile_ok=1; "${script}" "${DURATION_SECONDS}" || profile_ok=0
+    "${script}" "${DURATION_SECONDS}" &
   else
-    profile_ok=1; "${script}" "${TARGET_CONTAINER}" "${DURATION_SECONDS}" || profile_ok=0
+    "${script}" "${TARGET_CONTAINER}" "${DURATION_SECONDS}" &
   fi
+  CURRENT_FAULT_PID=$!
+  profile_ok=1
+  wait "${CURRENT_FAULT_PID}" || profile_ok=0
+  CURRENT_FAULT_PID=""
   end_ts="$(now)"
 
   if [ "${profile_ok}" -eq 0 ]; then

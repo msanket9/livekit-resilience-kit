@@ -18,7 +18,7 @@ CONTAINER_NAME="pumba-gateway-dropout-$$"
 cleanup() {
   docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "== Gateway dropout: ${DROPOUT_SECONDS}s of 100% loss every ${INTERVAL_SECONDS}s on ${TARGET_CONTAINER}, for ${DURATION_SECONDS}s total =="
 docker run --rm \

@@ -129,9 +129,11 @@ While the stack is up, LiveKit's own signals are captured as JSON lines under `.
   `track_published`, `participant_left`, `room_finished`, ...), verified and logged by the
   `webhook-receiver` service.
 
-These files accumulate for the life of a `docker compose up` session — run
-`rm -f data/*.jsonl` (or `docker compose down && docker compose up`) before a fresh test
-run if you want a clean slate.
+These files are append-only and accumulate across runs. That is deliberate — the report
+slices them by the `run_id` time windows in `data/run_manifest.jsonl`, so an old run stays
+reproducible — but it means anything scanning the full stream has to be run-aware. Run
+`rm -f data/*.jsonl` (or `docker compose down && docker compose up`) if you want a clean
+slate.
 
 ## Running the full suite + report
 
@@ -139,39 +141,69 @@ With the stack up, run every profile back-to-back and generate a clean-vs-degrad
 comparison:
 
 ```bash
-./scripts/run_test_suite.sh          # DURATION_SECONDS=60 PROFILES="clean rural_4g ..." to override
+./scripts/run_test_suite.sh          # DURATION_SECONDS=60 COOLDOWN_SECONDS=10 PROFILES="clean rural_4g ..." to override
 python3 scripts/generate_report.py   # writes reports/report-<run_id>.{json,md,html}
 ```
 
-Sample output (all five profiles, one run, agent attached — full table, scroll right in the
-`.html` version for the agent columns):
+The metric logic has its own regression suite. Every case in it is a bug that actually
+shipped, and each one failed silently as a wrong number rather than an error, which is the
+failure mode worth pinning down in a harness whose entire output is measurements:
 
-| Profile | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio | Agent turns (ok/failed) | Avg turn length |
+```bash
+python3 scripts/test_generate_report.py   # no dependencies, exits non-zero on failure
+```
+
+Sample output (all five profiles, one run, 35s each, agent attached — abbreviated; the
+full table is 11 columns wide, scroll right in the `.html` version for the agent columns):
+
+| Profile | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | Concealed audio | Agent turns (detected, ok/failed) | Avg turn length |
 |---|---|---|---|---|---|---|
-| clean | 100.0% / 0% / 0% / 0% | 0 | — | 0.05s | 5/0 | 4.74s |
-| rural_4g | 100.0% / 0% / 0% / 0% | 0 | — | 0.18s | 7/0 | 4.53s |
-| gateway_dropout | 50.0% / 25.0% / 25.0% / 0% | 0 | — | 3.98s | 6/0 | 4.74s |
-| congested_wifi | 100.0% / 0% / 0% / 0% | 0 | — | 0.01s | 6/0 | 4.59s |
-| severe_outage | 66.7% / 0% / 0% / 33.3% | 1 | 16.86s | 19.98s | 1/3 | 4.51s |
+| clean | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s | 5 (5/0) | 3.97s |
+| rural_4g | 100.0% / 0% / 0% / 0% | 0 | — | 0.29s | 6 (6/0) | 3.99s |
+| gateway_dropout | 58.4% / 27.8% / 13.9% / 0% | 0 | — | 3.94s | 6 (6/0) | 3.71s |
+| congested_wifi | 100.0% / 0% / 0% / 0% | 0 | — | 0.0s | 5 (5/0) | 4.01s |
+| severe_outage | 45.7% / 0% / 0% / 54.3% | 1 | 12.41s | 19.06s | 2 (2/0) | 3.54s |
+
+The quality percentages are **time-weighted** — the share of the window actually spent at
+each level. `connection_quality_changed` fires only on a change, so counting the events
+weights the result by number of transitions instead, and the two disagree badly: the
+`severe_outage` window above reads 33.3% LOST by event count against 54.3% by time. The
+event-count version also flattered the result, which is the wrong direction for a
+resilience report to be wrong in.
 
 A few things worth noting in that data:
 
 - A short ~4s `gateway_dropout` never trips LiveKit's client-side reconnect logic (0
   reconnects) — it only shows up as a connection-quality dip and concealed audio. It took a
   continuous 25s outage (`severe_outage`) to actually force a `reconnecting` → `reconnected`
-  cycle, which then took ~17s to recover — real numbers for a mechanism LiveKit ships but
-  doesn't otherwise expose. That same outage is also the only profile where the agent's
-  turn detection actually fails (1 ok / 3 failed) — see [Agent leg](#agent-leg).
+  cycle, which then took ~12s to recover — real numbers for a mechanism LiveKit ships but
+  doesn't otherwise expose.
 - `concealed_samples` is a more sensitive signal than the connection-quality label for
-  milder profiles: `rural_4g` shows measurable concealed audio (0.18s) while its quality
-  label stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
+  milder profiles: `rural_4g` shows measurable concealed audio while its quality label
+  stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
   scorer excluding jitter/RTT from its score (see "Why this exists" above).
+- **Turn count, not turn failure, is what degrades.** `turns_failed` counts turns the VAD
+  opened but never completed, and across 39 recorded profile windows it has been non-zero
+  exactly twice. When audio stops arriving the VAD has nothing to fail on — it simply never
+  opens a turn. `severe_outage` above shows 2 turns where `clean` shows 5, and that drop is
+  the real signal. The report shows detected count alongside the ok/failed split for exactly
+  this reason; the split alone reads "2 (2/0)" and looks like a clean sweep.
 - Computing concealed-audio duration correctly across a `severe_outage` window took a fix:
   a full reconnect re-subscribes to a **new track SID** whose cumulative WebRTC counters
   reset to 0, so a naive "last value at window end minus last value at window start" diff
   crosses that SID boundary, goes negative, and silently reports 0 — hiding the ~19s of real
   concealment that happened on the old track right before it was torn down. The report
   generator now diffs each track SID separately and sums across SID changes within a window.
+- An interrupted run never leaves a fault applied. Each fault script traps its signals and
+  lets Pumba restore the netem rules it set; the suite additionally forwards a signal to
+  the fault script it is waiting on and sweeps any Pumba container that outlived its
+  parent. Without the second half, killing the suite directly (rather than Ctrl-C, which
+  the terminal sends to the whole process group) left 166ms of injected latency applied to
+  `client-a` indefinitely, silently degrading every later run.
+- Profiles are separated by a `COOLDOWN_SECONDS` (default 10s) gap that sits outside every
+  measured window. Back-to-back profiles let one fault's tail land in the next profile's
+  numbers: LiveKit's bandwidth estimator ramps back up over seconds, the jitter buffer is
+  still draining, and a track torn down at the end of a fault may not be resubscribed yet.
 
 ## Measuring RED's actual effect
 
@@ -193,18 +225,29 @@ python3 scripts/generate_report.py --run-id <second_run_id>
 
 Note RED only protects against *partial* packet loss (redundant copies ride in later
 packets) — it can't help against a full blackout like `gateway_dropout`/`severe_outage`, so
-`rural_4g` or `congested_wifi` are the right profiles for this comparison, not those. Actual
-measured result, same `rural_4g` profile, 60s each, only RED toggled:
+`rural_4g` or `congested_wifi` are the right profiles for this comparison, not those.
 
-| RED | Quality (Excellent/Good/Poor/Lost) | Concealed audio |
-|---|---|---|
-| on (default) | 100.0% / 0% / 0% / 0% | 0.27s |
-| off | 50.0% / 50.0% / 0% / 0% | 2.15s |
+**This harness cannot currently resolve RED's effect, and it is worth being straight about
+that.** Three 60s `rural_4g` runs per arm, only RED toggled, concealed audio in seconds:
 
-RED cut concealed audio by roughly 8x under identical injected loss/jitter/bandwidth, and
-kept `ConnectionQuality` steady at "Excellent" instead of dropping half the time to "Good."
-The vendor claim holds up — and now there's a measured number behind it instead of just a
-blog post.
+| RED | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| on (default) | 1.08s | 1.74s | 0.02s | 1.08s |
+| off | 2.28s | 0.99s | 1.37s | 1.37s |
+
+The medians differ by 1.3x, but the distributions overlap: the best RED-off run beat two of
+the three RED-on runs. Run-to-run variance under 3.5% *random* loss is simply larger than
+the effect at this sample size and duration, so no honest conclusion about RED can be drawn
+from it either way. An earlier revision of this README reported an 8x reduction here. That
+came from a single run per arm and does not survive repetition — it is withdrawn.
+
+Resolving this properly needs the measurement to change, not just more patience: many more
+repetitions per arm, longer windows, and ideally a deterministic loss pattern rather than a
+random one, so both arms see the same losses. LiveKit's own
+[claim](https://livekit.com/blog/audio-quality) that RED lets audio tolerate "~20–30% packet
+loss without retransmission" is also made at far higher loss rates than the 3.5% this
+profile injects, where there is more for RED to recover. The `RED_ENABLED` toggle and the
+comparison harness are real and work; the experiment run through them is underpowered.
 
 ## Agent leg
 
@@ -240,40 +283,76 @@ Two things had to be verified empirically before this worked at all, not assumed
    `client-a`/`client-b` on `condition: service_healthy` so the room is never created before
    the agent can be dispatched into it.
 
-Real measured result from the table above: every profile completes all its turns cleanly
-(0 failures) **except** `severe_outage`, which fails 3 of 4 (VAD never gets the frames to
-detect end-of-speech during a 25s blackout — a genuine turn-taking failure, not a fault in
-the harness). A separate, more tightly-timed `gateway_dropout` run (interval=15s instead of
-the default 45s, so multiple dropouts land clearly mid-window instead of once at a profile
-boundary) shows the *other* failure mode: turns don't fail, but get truncated —
+What the agent leg actually detects under fault, in order of how reliably it fires:
 
-| Profile | Agent turns (ok/failed) | Avg turn length | Concealed audio |
-|---|---|---|---|
-| clean | 6/0 | 4.24s | 0.02s |
-| gateway_dropout (interval=15s) | 5/0 | 3.28s | 12.47s |
+1. **Fewer turns.** The dominant signal. `severe_outage` yields 2 turns where `clean`
+   yields 5 — during a blackout the VAD receives no frames, so it never opens a turn at
+   all.
+2. **Shorter turns.** A real utterance the agent should hear as one continuous turn gets
+   cut short mid-sentence when frames stop arriving partway through it. A tightly-timed
+   `gateway_dropout` run (interval=15s instead of the default 45s, so multiple dropouts
+   land mid-window rather than once at a profile boundary) isolates this:
 
-— a real utterance the agent should hear as one continuous turn gets cut short mid-sentence
-when frames stop arriving partway through it. Response latency itself stayed flat across
-every profile (sub-millisecond) — expected, since this synthetic agent's "response" is
-locally generated and doesn't depend on receiving anything back over the network; the
-network-sensitive signals here are turn completion and turn length, not response latency.
+   | Profile | Agent turns (ok/failed) | Avg turn length | Concealed audio |
+   |---|---|---|---|
+   | clean | 6/0 | 4.24s | 0.02s |
+   | gateway_dropout (interval=15s) | 5/0 | 3.28s | 12.47s |
 
-Two bugs surfaced building this, both fixed before trusting the numbers above:
+3. **Outright turn failure** — a turn the VAD opens and never completes. This is the
+   rarest of the three: non-zero in 2 of 39 recorded profile windows (a `severe_outage`
+   run that failed 3 of 4 turns, and one `congested_wifi` run that failed 1 of 3). Real,
+   but not something to build a demo around.
+
+**Response latency** is reported as the gap from the speaker's last word to the agent's
+first response frame — VAD detection hold included. It reads ~577ms and is nearly constant
+across every profile, which is honest rather than surprising: Silero's default
+`min_silence_duration` is 0.55s and dominates the number, and this synthetic agent's
+"response" is generated locally, so nothing in the path depends on the network. The
+per-event JSON breaks out `publish_latency_ms` and `vad_silence_hold_ms` separately so a
+regression in the agent's own code path stays visible against that fixed hold. Once real
+STT/LLM/TTS plugins are swapped in, this is the column that starts moving.
+
+One caveat is guarded rather than assumed away. The VAD measures silence in *audio* time,
+so if frames stop arriving altogether it stalls instead of accumulating silence, and
+inferring wall-clock end-of-speech from it would understate the real wait. Each event
+therefore also carries `since_last_frame_ms`, the wall-clock gap since the VAD last
+received a frame — a large value means that row's latency is distorted by a stall rather
+than a genuinely fast response. In practice it has stayed under 10ms in every profile
+including `severe_outage`, because a blackout produces no completed turn at all rather
+than a late one. The guard has never fired; it is there so a distorted reading cannot be
+mistaken for a good one.
+
+Three bugs surfaced building this, all fixed before trusting the numbers above:
 - The first version measured "response latency" as time-to-*finish-playing* the whole 1s
-  response tone (always ≥1000ms) instead of time-to-*first-frame-pushed*. Fixed by timing
-  the first frame specifically.
+  response tone (always ≥1000ms) instead of time-to-*first-frame-pushed*.
+- The fix for that overcorrected: timing from the moment the `END_OF_SPEECH` event was
+  *consumed* excluded the VAD's own detection hold, leaving a metric that measured only
+  frame allocation. It read 0.40–1.18ms across a whole run with no separation between the
+  clean profile and a 25s outage. Now measured from the inferred end of speech
+  (`event.silence_duration` before the event fires), which is the gap a caller actually
+  experiences.
 - A turn that starts in one profile's window but completes a moment into the next one was
   originally counted as a failure in the first window, purely because of where the fault
   boundary happened to fall — not a real failure. Fixed by pairing turns across the full
   event stream and attributing each one to whichever window it *started* in, the same fix
   already applied to `concealed_samples` across a track-SID change.
 
+The VAD model is loaded once per worker process via `WorkerOptions(prewarm_fnc=...)`, not
+per track subscription. `silero.VAD.load()` is a blocking call whose own docstring points
+at prewarm; loading it inside the per-track handler put a synchronous model load on the
+event loop at every reconnect, which is exactly when the agent-recovery metric is timed.
+
 ## Status
 
 Done: local stack, all five fault profiles (verified against real ping/iperf3
 measurements, not just their config), client + webhook metrics capture, the run
-orchestrator and report generator, the RED on/off comparison, and the synthetic agent leg
-above.
+orchestrator and report generator, and the synthetic agent leg above.
+
+Built but underpowered: the RED on/off comparison. The toggle and the harness around it
+work; the experiment run through them cannot resolve RED's effect above run-to-run
+variance at three 60s runs per arm. See
+[Measuring RED's actual effect](#measuring-reds-actual-effect) — it needs more repetitions
+and a deterministic loss pattern before it says anything.
 
 Not done: swapping the synthetic agent's local VAD + synthetic-tone stand-in for real
 STT/LLM/TTS plugins — a drop-in change once API keys are available, not a redesign. Video

@@ -10,13 +10,26 @@ services:
       - ./data:/data
     networks:
       - resilience-net
+    healthcheck:
+      # server.py has always exposed /healthz; nothing used it. Wiring it up so
+      # livekit-server waits for the receiver to actually be listening rather
+      # than merely for its container to have started -- a webhook fired at a
+      # process that has not bound its port yet is simply lost, and the server
+      # webhooks are the report's independent cross-check on client-reported
+      # reconnects.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
 
   livekit-server:
     image: livekit/livekit-server:latest
     container_name: livekit-server
     command: --config /etc/livekit.yaml --dev
     depends_on:
-      - webhook-receiver
+      webhook-receiver:
+        condition: service_healthy
     volumes:
       - ./config/livekit.yaml:/etc/livekit.yaml:ro
     ports:

@@ -58,12 +58,21 @@ SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
 FRAME_MS = 10
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
+# Consecutive get_stats() failures before a track's stats poller gives up.
+MAX_STATS_POLL_FAILURES = 10
+
+
+# Opened once and line-buffered rather than reopened per event: the stats
+# poller writes a record per subscribed track every AUDIO_STATS_POLL_SECONDS
+# for the whole run, and line buffering still flushes each event immediately,
+# so a report can be generated against a live stack.
+os.makedirs(os.path.dirname(EVENT_LOG_PATH) or ".", exist_ok=True)
+_event_log = open(EVENT_LOG_PATH, "a", buffering=1)
 
 
 def log_event(event: str, **fields) -> None:
     record = {"ts": time.time(), "identity": IDENTITY, "event": event, **fields}
-    with open(EVENT_LOG_PATH, "a") as f:
-        f.write(json.dumps(record) + "\n")
+    _event_log.write(json.dumps(record) + "\n")
 
 
 def make_token() -> str:
@@ -110,6 +119,54 @@ def synthesize_speech(phrase: str) -> np.ndarray:
     return resampled.astype(np.int16)
 
 
+async def capture_paced(
+    source: rtc.AudioSource, samples: np.ndarray, deadline: float | None = None
+) -> float:
+    """Push `samples` into `source` as real-time-paced frames, returning the
+    deadline the next call should continue from.
+
+    Pacing is against an ABSOLUTE per-frame deadline, not a fixed
+    `await asyncio.sleep(FRAME_MS / 1000)` after each frame. A fixed sleep does
+    not produce a 10ms cadence: event-loop timer granularity plus the FFI
+    round-trip inside capture_frame stack on top of it. Measured in this
+    container, 500 back-to-back `asyncio.sleep(0.01)` calls take 6.11s of wall
+    clock to cover 5.00s of audio -- 22% slower than real time, before
+    capture_frame is even in the loop.
+
+    That matters well beyond cosmetics. A source fed slower than real time
+    underruns; the subscriber's jitter buffer runs dry; WebRTC fills the gap
+    with packet-loss concealment. That puts a floor under `concealed_samples`
+    that has nothing to do with the injected fault -- and concealed_samples is
+    the single most load-bearing number this kit reports. Corroborating sign
+    from a real run: the espeak utterance is 4.36s long but the agent's VAD
+    measured it at 4.64s on the clean profile.
+
+    Tracking an absolute deadline keeps the cadence honest and lets one slow
+    frame be absorbed by the next sleep instead of accumulating. If we fall
+    more than a frame behind, the deadline resets to now rather than bursting
+    frames to "catch up", which would only trade an underrun for an overrun.
+    """
+    if deadline is None:
+        deadline = time.monotonic()
+    frame_s = FRAME_MS / 1000
+
+    for i in range(0, len(samples), SAMPLES_PER_FRAME):
+        chunk = samples[i : i + SAMPLES_PER_FRAME]
+        frame = rtc.AudioFrame.create(SAMPLE_RATE, NUM_CHANNELS, SAMPLES_PER_FRAME)
+        fsamples = np.frombuffer(frame.data, dtype=np.int16)
+        fsamples[: len(chunk)] = chunk
+        fsamples[len(chunk) :] = 0
+        await source.capture_frame(frame)
+
+        deadline += frame_s
+        drift = deadline - time.monotonic()
+        if drift > 0:
+            await asyncio.sleep(drift)
+        elif drift < -frame_s:
+            deadline = time.monotonic()
+    return deadline
+
+
 async def publish_speech_loop(room: rtc.Room) -> None:
     source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
     track = rtc.LocalAudioTrack.create_audio_track("speech-loop", source)
@@ -129,15 +186,11 @@ async def publish_speech_loop(room: rtc.Room) -> None:
         SPEECH_PHRASE,
     )
 
+    # One deadline carried across loop iterations, so the pacing does not
+    # silently reset (and re-accumulate drift) at every utterance boundary.
+    deadline = None
     while True:
-        for i in range(0, len(loop_samples), SAMPLES_PER_FRAME):
-            chunk = loop_samples[i : i + SAMPLES_PER_FRAME]
-            frame = rtc.AudioFrame.create(SAMPLE_RATE, NUM_CHANNELS, SAMPLES_PER_FRAME)
-            fsamples = np.frombuffer(frame.data, dtype=np.int16)
-            fsamples[: len(chunk)] = chunk
-            fsamples[len(chunk) :] = 0
-            await source.capture_frame(frame)
-            await asyncio.sleep(FRAME_MS / 1000)
+        deadline = await capture_paced(source, loop_samples, deadline)
 
 
 async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant) -> None:
@@ -155,13 +208,39 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
     freeze total is the last-polled value, and average buffer delay is
     jitter_buffer_delay_s / jitter_buffer_emitted_count.
     """
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(AUDIO_STATS_POLL_SECONDS)
         try:
             stats = await track.get_stats()
         except Exception:
-            log.exception("get_stats failed for participant=%s", participant.identity)
-            return
+            # A single failed poll used to end stats collection for this track
+            # permanently -- and a fault window is exactly when a poll is most
+            # likely to fail, so the metric went quiet precisely where it
+            # mattered. Keep polling; give up only if the track is clearly gone.
+            consecutive_failures += 1
+            log.warning(
+                "get_stats failed for participant=%s (%d consecutive)",
+                participant.identity,
+                consecutive_failures,
+                exc_info=consecutive_failures == 1,
+            )
+            if consecutive_failures >= MAX_STATS_POLL_FAILURES:
+                log.error(
+                    "giving up stats polling for participant=%s sid=%s after %d consecutive failures",
+                    participant.identity,
+                    publication.sid,
+                    consecutive_failures,
+                )
+                log_event(
+                    "track_stats_abandoned",
+                    participant=participant.identity,
+                    track_sid=publication.sid,
+                    consecutive_failures=consecutive_failures,
+                )
+                return
+            continue
+        consecutive_failures = 0
 
         for stat in stats:
             if stat.WhichOneof("stats") != "inbound_rtp":
@@ -178,6 +257,15 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
                 jitter_buffer_delay_s=inbound.jitter_buffer_delay,
                 jitter_buffer_emitted_count=inbound.jitter_buffer_emitted_count,
             )
+
+
+def _on_publish_task_done(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("publish loop died", exc_info=exc)
+        log_event("publish_loop_failed", error=repr(exc))
 
 
 async def main() -> None:
@@ -267,11 +355,27 @@ async def main() -> None:
     log.info("connected to room %s (time_to_first_connect_ms=%.0f)", room.name, time_to_first_connect_ms)
     log_event("connected", room=room.name, time_to_first_connect_ms=time_to_first_connect_ms)
 
+    publish_task = None
     if PUBLISH_AUDIO:
-        asyncio.create_task(publish_speech_loop(room))
+        # Held in a local for the lifetime of main(): asyncio keeps only a weak
+        # reference to a running task, so a bare create_task() whose handle is
+        # discarded can be garbage-collected mid-run. The done callback matters
+        # just as much -- without anything awaiting or inspecting it, an
+        # exception inside the publish loop vanished silently and the run
+        # carried on producing a report from a stream that had stopped.
+        publish_task = asyncio.create_task(publish_speech_loop(room))
+        publish_task.add_done_callback(_on_publish_task_done)
 
     # Keep the client alive to observe events / faults.
-    await asyncio.Event().wait()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        pending = list(stats_tasks.values())
+        if publish_task is not None:
+            pending.append(publish_task)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 if __name__ == "__main__":
