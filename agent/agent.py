@@ -27,10 +27,12 @@ from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 from livekit.plugins import silero
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+# No logging.basicConfig() here: livekit-agents' cli.run_app() already
+# configures the worker process's own (structured JSON) logging. Adding a
+# second handler on top of it doesn't fail anything, but it does render
+# every log line 2-3x -- verified in data/agent-events.jsonl that this was
+# purely a duplicate-handler rendering issue, not a duplicate task/event
+# bug (exact expected event counts, no double-published turns).
 log = logging.getLogger("agent")
 
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://livekit-server:7880")

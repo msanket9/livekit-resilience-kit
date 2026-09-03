@@ -203,6 +203,67 @@ def agent_stats(agent_events, start_ts, end_ts):
     }
 
 
+def webhook_rejoin_stats(webhook_events, start_ts, end_ts, participant="client-a"):
+    """Server-side (LiveKit webhook) cross-check of participant/track churn
+    within [start_ts, end_ts] -- a signal independent of the client's own
+    self-reported reconnecting/reconnected events, since the server is the
+    authority on whether a participant actually left and rejoined the room.
+    Only room_started's initial joins land before any profile window starts,
+    so a non-zero participant_joined count here means a real server-observed
+    rejoin happened during this specific fault."""
+    events = [e for e in webhook_events if start_ts <= e.get("received_ts", 0) <= end_ts]
+
+    def kind(e):
+        return e.get("event", {}).get("event")
+
+    def event_participant(e):
+        return e.get("event", {}).get("participant", {}).get("identity")
+
+    def track_participant(e):
+        return e.get("event", {}).get("participant", {}).get("identity")
+
+    return {
+        "participant_joined": sum(1 for e in events if kind(e) == "participant_joined" and event_participant(e) == participant),
+        "participant_left": sum(1 for e in events if kind(e) == "participant_left" and event_participant(e) == participant),
+        "track_published": sum(1 for e in events if kind(e) == "track_published" and track_participant(e) == participant),
+        "track_unpublished": sum(1 for e in events if kind(e) == "track_unpublished" and track_participant(e) == participant),
+    }
+
+
+def _pair_agent_drops(agent_events):
+    """Pairs each time the agent lost its subscription to client-a's track
+    (track_unsubscribed) with the agent's next successfully completed turn
+    (response_published) that follows -- the agent's own "time-to-recover
+    after a drop", distinct from reconnect_stats: that measures the
+    client's connection-level recovery, this measures whether the agent's
+    turn-taking pipeline actually resumed working. Computed over the FULL
+    stream, not window-restricted, for the same boundary-truncation reason
+    as _pair_agent_turns."""
+    events = sorted(agent_events, key=lambda e: e["ts"])
+    drops = []
+    pending_drop_ts = None
+    for e in events:
+        if e["event"] == "track_unsubscribed" and e.get("participant") == "client-a":
+            pending_drop_ts = e["ts"]
+        elif e["event"] == "response_published" and pending_drop_ts is not None:
+            drops.append({"drop_ts": pending_drop_ts, "recovery_s": e["ts"] - pending_drop_ts})
+            pending_drop_ts = None
+    return drops
+
+
+def agent_recovery_stats(agent_events, start_ts, end_ts):
+    """A drop belongs to a profile window if the track_unsubscribed that
+    started it happened within [start_ts, end_ts], regardless of when
+    recovery completed (the same "belongs to where it started" convention
+    as agent_stats)."""
+    drops = [d for d in _pair_agent_drops(agent_events) if start_ts <= d["drop_ts"] <= end_ts]
+    recoveries = [d["recovery_s"] for d in drops]
+    return {
+        "drop_count": len(drops),
+        "avg_recovery_s": round(sum(recoveries) / len(recoveries), 2) if recoveries else None,
+    }
+
+
 def time_to_first_connect(events_by_client):
     result = {}
     for identity, events in events_by_client.items():
@@ -213,7 +274,7 @@ def time_to_first_connect(events_by_client):
     return result
 
 
-def build_summary(run_id, manifest_entries, client_a_events, client_b_events, agent_events):
+def build_summary(run_id, manifest_entries, client_a_events, client_b_events, agent_events, webhook_events):
     profiles = []
     for entry in sorted(manifest_entries, key=lambda e: e["start_ts"]):
         start_ts, end_ts = entry["start_ts"], entry["end_ts"]
@@ -227,6 +288,8 @@ def build_summary(run_id, manifest_entries, client_a_events, client_b_events, ag
                 "reconnects": reconnect_stats(client_a_events, start_ts, end_ts),
                 "concealment": concealment_stats(client_b_events, start_ts, end_ts),
                 "agent": agent_stats(agent_events, start_ts, end_ts),
+                "agent_recovery": agent_recovery_stats(agent_events, start_ts, end_ts),
+                "webhook_rejoins": webhook_rejoin_stats(webhook_events, start_ts, end_ts),
             }
         )
     return {
@@ -245,9 +308,10 @@ def render_markdown(summary):
     lines.append("")
     lines.append(
         "| Profile | Duration | Quality (Excellent/Good/Poor/Lost) | Reconnects | Avg recovery | "
-        "Concealed audio | Agent turns (ok/failed) | Avg turn length | Avg response latency |"
+        "Server rejoins | Concealed audio | Agent turns (ok/failed) | Avg turn length | "
+        "Avg response latency | Agent recovery |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for p in summary["profiles"]:
         pct = p["quality"]["percent"]
         quality_str = " / ".join(f"{pct.get(k, 0)}%" for k in ("EXCELLENT", "GOOD", "POOR", "LOST"))
@@ -258,9 +322,15 @@ def render_markdown(summary):
         turns = f"{ag['turns_completed']}/{ag['turns_failed']}"
         turn_len = f"{ag['avg_speech_duration_s']}s" if ag["avg_speech_duration_s"] is not None else "—"
         latency = f"{ag['avg_response_latency_ms']}ms" if ag["avg_response_latency_ms"] is not None else "—"
+        wh = p["webhook_rejoins"]
+        server_rejoins = str(wh["participant_joined"])
+        agrec = p["agent_recovery"]
+        agent_recovery_str = (
+            f"{agrec['drop_count']}x, avg {agrec['avg_recovery_s']}s" if agrec["avg_recovery_s"] is not None else "—"
+        )
         lines.append(
             f"| {p['profile']} | {p['duration_s']}s | {quality_str} | {rc['reconnect_count']} | {recovery} | "
-            f"{concealed} | {turns} | {turn_len} | {latency} |"
+            f"{server_rejoins} | {concealed} | {turns} | {turn_len} | {latency} | {agent_recovery_str} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -279,6 +349,12 @@ def render_html(summary):
         turns = f"{ag['turns_completed']}/{ag['turns_failed']}"
         turn_len = f"{ag['avg_speech_duration_s']}s" if ag["avg_speech_duration_s"] is not None else "—"
         latency = f"{ag['avg_response_latency_ms']}ms" if ag["avg_response_latency_ms"] is not None else "—"
+        wh = p["webhook_rejoins"]
+        server_rejoins = str(wh["participant_joined"])
+        agrec = p["agent_recovery"]
+        agent_recovery_str = (
+            f"{agrec['drop_count']}x, avg {agrec['avg_recovery_s']}s" if agrec["avg_recovery_s"] is not None else "—"
+        )
         rows.append(
             f"""
         <tr>
@@ -287,10 +363,12 @@ def render_html(summary):
           <td>{quality_str}</td>
           <td>{rc['reconnect_count']}</td>
           <td>{recovery}</td>
+          <td>{server_rejoins}</td>
           <td>{concealed}</td>
           <td>{turns}</td>
           <td>{turn_len}</td>
           <td>{latency}</td>
+          <td>{agent_recovery_str}</td>
         </tr>"""
         )
     return f"""<!doctype html>
@@ -316,8 +394,8 @@ def render_html(summary):
   <table>
     <tr>
       <th>Profile</th><th>Duration</th><th>Quality (Excellent/Good/Poor/Lost)</th><th>Reconnects</th>
-      <th>Avg recovery</th><th>Concealed audio</th><th>Agent turns (ok/failed)</th>
-      <th>Avg turn length</th><th>Avg response latency</th>
+      <th>Avg recovery</th><th>Server rejoins</th><th>Concealed audio</th><th>Agent turns (ok/failed)</th>
+      <th>Avg turn length</th><th>Avg response latency</th><th>Agent recovery</th>
     </tr>
     {''.join(rows)}
   </table>
@@ -340,8 +418,11 @@ def main():
     client_a_events = read_jsonl(os.path.join(args.data_dir, "client-a-events.jsonl"))
     client_b_events = read_jsonl(os.path.join(args.data_dir, "client-b-events.jsonl"))
     agent_events = read_jsonl(os.path.join(args.data_dir, "agent-events.jsonl"))
+    webhook_events = read_jsonl(os.path.join(args.data_dir, "webhooks.jsonl"))
 
-    summary = build_summary(run_id, manifest_entries, client_a_events, client_b_events, agent_events)
+    summary = build_summary(
+        run_id, manifest_entries, client_a_events, client_b_events, agent_events, webhook_events
+    )
 
     os.makedirs(args.out_dir, exist_ok=True)
     json_path = os.path.join(args.out_dir, f"report-{run_id}.json")
