@@ -361,21 +361,3 @@ The VAD model is loaded once per worker process via `WorkerOptions(prewarm_fnc=.
 per track subscription. `silero.VAD.load()` is a blocking call whose own docstring points
 at prewarm; loading it inside the per-track handler put a synchronous model load on the
 event loop at every reconnect, which is exactly when the agent-recovery metric is timed.
-
-## Status
-
-Done: local stack, all five fault profiles (verified against real ping/iperf3
-measurements, not just their config), client + webhook metrics capture, the run
-orchestrator and report generator, and the synthetic agent leg above.
-
-Built but underpowered: the RED on/off comparison. The toggle and the harness around it
-work; the experiment run through them cannot resolve RED's effect above run-to-run
-variance at three 60s runs per arm. See
-[Measuring RED's actual effect](#measuring-reds-actual-effect) — it needs more repetitions
-and a deterministic loss pattern before it says anything.
-
-Not done: swapping the synthetic agent's local VAD + synthetic-tone stand-in for real
-STT/LLM/TTS plugins — a drop-in change once API keys are available, not a redesign. Video
-testing, multi-region testing, and Prometheus/Grafana export are explicitly out of scope
-for this version (audio-only, single-machine, JSON/HTML reports are enough to prove the
-concept).
