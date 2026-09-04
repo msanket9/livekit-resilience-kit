@@ -29,7 +29,7 @@ echo "== Injecting ${DELAY_MS}ms delay into ${TARGET_CONTAINER} via Pumba for ${
 docker run --rm \
   --name "${CONTAINER_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   netem --duration "${DURATION}" delay --time "${DELAY_MS}" "${TARGET_CONTAINER}" &
 PUMBA_PID=$!
 

@@ -9,7 +9,9 @@ Run with:  python3 scripts/test_generate_report.py
 No dependencies beyond the standard library; exits non-zero on failure.
 """
 
+import contextlib
 import html
+import io
 import json
 import os
 import re
@@ -223,6 +225,40 @@ with tempfile.TemporaryDirectory() as d:
     check("deadline is the next run's start", g.load_manifest(path, "A")[2], 200)
     check("newest run is unbounded", g.load_manifest(path, "B")[2], FOREVER)
     check("default run_id is the last one recorded", g.load_manifest(path, None)[0], "B")
+
+print("read_jsonl survives a malformed line")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "events.jsonl")
+    # A torn write (the realistic case: these logs are read while their
+    # writer may still be appending) shouldn't cost the good lines around it.
+    with open(path, "w") as f:
+        f.write(json.dumps({"ts": 1, "event": "a"}) + "\n")
+        f.write('{"ts": 2, "event": "b"' + "\n")  # truncated mid-object
+        f.write(json.dumps({"ts": 3, "event": "c"}) + "\n")
+    with contextlib.redirect_stderr(io.StringIO()) as captured:
+        records = g.read_jsonl(path)
+    check("good lines survive a malformed neighbor", [r["event"] for r in records], ["a", "c"])
+    check("the bad line is warned about, not silently dropped", "malformed" in captured.getvalue(), True)
+check("a missing file returns empty, not an error", g.read_jsonl("/no/such/path.jsonl"), [])
+
+print("build_summary rejects an inverted profile window")
+try:
+    g.build_summary(
+        "bad",
+        [{"run_id": "bad", "profile": "clean", "duration_s": 10, "start_ts": 200, "end_ts": 150}],
+        [], [], [], [],
+    )
+    check("inverted window raises", "no exception raised", "SystemExit")
+except SystemExit:
+    check("inverted window raises", "SystemExit", "SystemExit")
+
+print("in_window (bisect) agrees with a plain linear scan")
+def linear_in_window(events, start_ts, end_ts):
+    return [e for e in events if start_ts <= e["ts"] <= end_ts]
+webhook_probe = [{"ts": t} for t in (95, 99, 100, 100, 105, 110, 110, 115)]
+for lo, hi in ((100, 110), (0, 94), (116, 200), (100, 100), (105, 105.0001)):
+    check(f"in_window matches linear scan for [{lo}, {hi}]",
+          g.in_window(webhook_probe, lo, hi), linear_in_window(webhook_probe, lo, hi))
 
 print("renderers share one source of truth")
 summary = g.build_summary(

@@ -22,9 +22,19 @@ services:
       timeout: 3s
       retries: 15
       start_period: 3s
+    restart: on-failure:3
 
   livekit-server:
-    image: livekit/livekit-server:latest
+    # Pinned exactly, for the same reason the three requirements.txt files
+    # pin the Python SDKs: this kit's output is measurements, and livekit-server
+    # is the actual SFU whose congestion control, jitter buffer, and RED
+    # handling directly produce the connection-quality and concealed-audio
+    # numbers being measured -- an unpinned server image is a more direct
+    # violation of "don't silently compare numbers from a different WebRTC
+    # stack" than the already-pinned Python clients. v1.13.6 is what `:latest`
+    # resolved to when this was pinned (same image digest, confirmed via
+    # `docker inspect`).
+    image: livekit/livekit-server:v1.13.6
     container_name: livekit-server
     command: --config /etc/livekit.yaml --dev
     depends_on:
@@ -38,6 +48,7 @@ services:
       - "50000-50019:50000-50019/udp"
     networks:
       - resilience-net
+    restart: on-failure:3
 
   client-a:
     build: ./client
@@ -60,6 +71,7 @@ services:
       - ./data:/data
     networks:
       - resilience-net
+    restart: on-failure:3
 
   client-b:
     build: ./client
@@ -81,6 +93,7 @@ services:
       - ./data:/data
     networks:
       - resilience-net
+    restart: on-failure:3
 
   agent:
     build: ./agent
@@ -97,16 +110,21 @@ services:
     networks:
       - resilience-net
     healthcheck:
-      # the worker's HTTP server comes up slightly before it finishes
-      # registering with the LiveKit server for automatic dispatch; clients
-      # wait on this so they don't create the room before the agent can be
-      # dispatched into it (dispatch is a room-creation-time event -- a
-      # worker that registers after the room already exists never gets it)
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/', timeout=2)"]
+      # Clients wait on this so they don't create the room before the agent
+      # can be dispatched into it (dispatch is a room-creation-time event --
+      # a worker that registers after the room already exists never gets it).
+      # Checking the HTTP endpoint ALONE is not enough: it comes up as soon as
+      # the worker process starts, before it has actually registered with
+      # LiveKit -- verified directly, pointed at an unreachable LIVEKIT_URL,
+      # it returned 200 OK for the whole connection-retry backoff window. The
+      # marker file is written by agent.py only on the SDK's own
+      # "worker_registered" event, so both together are the real signal.
+      test: ["CMD", "python3", "-c", "import os, urllib.request; assert os.path.exists('/tmp/agent-registered'); urllib.request.urlopen('http://localhost:8081/', timeout=2)"]
       interval: 2s
       timeout: 3s
       retries: 15
       start_period: 5s
+    restart: on-failure:3
 
 networks:
   resilience-net:

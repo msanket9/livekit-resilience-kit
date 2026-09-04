@@ -22,14 +22,22 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "== Congested WiFi: loss+jitter+10Mbps cap on ${TARGET_CONTAINER} for ${DURATION} =="
+# Backgrounded and joined via `wait`, not run in the foreground: bash defers a
+# trapped signal until a FOREGROUND command finishes on its own, so a SIGTERM
+# aimed at this script while `docker run` blocked in the foreground did not
+# reach `cleanup` until the fault's own duration elapsed on its own -- measured
+# at up to 29s of unwanted delay. `wait` on a backgrounded job is interrupted
+# immediately, matching rural_4g.sh's already-correct pattern.
 docker run --rm \
   --name "${CONTAINER_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   netem --duration "${DURATION}" combine \
     --delay --delay-time 30 --delay-jitter 30 \
     --loss --loss-percent 1.5 --loss-correlation 25 \
     --rate --rate-value 10mbit \
-    -- "${TARGET_CONTAINER}"
+    -- "${TARGET_CONTAINER}" &
+PUMBA_PID=$!
+wait "${PUMBA_PID}"
 
 echo "== Congested WiFi profile done =="

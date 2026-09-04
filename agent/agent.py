@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli
+from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli
 from livekit.plugins import silero
 
 # No logging.basicConfig() here: livekit-agents' cli.run_app() already
@@ -39,6 +39,10 @@ LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://livekit-server:7880")
 API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
 EVENT_LOG_PATH = os.getenv("EVENT_LOG_PATH", "/data/agent-events.jsonl")
+# Written once this worker has actually registered with LiveKit -- see the
+# "worker_registered" listener in __main__ for why the framework's default
+# health endpoint isn't enough on its own.
+READY_MARKER_PATH = os.getenv("READY_MARKER_PATH", "/tmp/agent-registered")
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
@@ -380,12 +384,40 @@ async def _cancel_and_wait(task: asyncio.Task) -> None:
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
-            ws_url=LIVEKIT_URL,
-            api_key=API_KEY,
-            api_secret=API_SECRET,
-        )
+    worker_options = WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
+        ws_url=LIVEKIT_URL,
+        api_key=API_KEY,
+        api_secret=API_SECRET,
     )
+    # cli.run_app() accepts WorkerOptions directly and would build this same
+    # AgentServer internally -- constructed explicitly here only to attach one
+    # listener before handing it off.
+    #
+    # docker-compose.yml gates client-a/client-b's startup on this worker's
+    # own healthcheck (GET /, the framework's default endpoint), on the theory
+    # that a room shouldn't be created before the agent can be dispatched into
+    # it. But that endpoint only proves the HTTP server is bound, not that
+    # registration with LiveKit actually succeeded -- verified directly:
+    # pointed at an unreachable LIVEKIT_URL, it returned 200 OK for the whole
+    # multi-attempt connection-retry backoff while the worker was still
+    # failing to connect. Since dispatch only happens at room-creation time
+    # with no retry of its own, a slow/cold host can let the healthcheck go
+    # green, client-a create the room, and the agent still not be registered
+    # yet -- the agent is then never dispatched, and nothing in the report
+    # signals that this happened; agent-events.jsonl just has a few startup
+    # lines and no turns for the whole run.
+    #
+    # "worker_registered" is a real event this SDK emits once registration
+    # actually completes (not an inference from "hasn't failed yet"). Writing
+    # a marker file on it lets the healthcheck require both signals.
+    server = AgentServer.from_server_options(worker_options)
+
+    @server.on("worker_registered")
+    def _on_worker_registered(worker_id: str, server_info) -> None:
+        log.info("worker registered with livekit (worker_id=%s)", worker_id)
+        with open(READY_MARKER_PATH, "w") as f:
+            f.write(worker_id)
+
+    cli.run_app(server)

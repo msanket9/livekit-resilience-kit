@@ -58,7 +58,16 @@ if RED_ENABLED not in ("default", "true", "false"):
 SPEECH_PHRASE = os.getenv(
     "SPEECH_PHRASE", "Testing the LiveKit resilience kit, one two three four five."
 )
+CONNECT_MAX_RETRIES = int(os.getenv("CONNECT_MAX_RETRIES", "10"))
+CONNECT_RETRY_BACKOFF_S = float(os.getenv("CONNECT_RETRY_BACKOFF_S", "2"))
 PAUSE_SECONDS = float(os.getenv("PAUSE_SECONDS", "2"))
+if PAUSE_SECONDS < 0:
+    raise SystemExit(
+        f"PAUSE_SECONDS must be >= 0, got {PAUSE_SECONDS}. A negative value crashes "
+        "np.zeros() inside the publish task after the room connection is already up, "
+        "which used to leave client-a connected and looking healthy while silently "
+        "never publishing any audio for the rest of the run."
+    )
 ESPEAK_RATE_WPM = int(os.getenv("ESPEAK_RATE_WPM", "150"))
 
 SAMPLE_RATE = 48000
@@ -222,6 +231,16 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
     jitter_buffer_delay_s / jitter_buffer_emitted_count.
     """
     consecutive_failures = 0
+    # Wall-clock time the current failure streak started, not the poll count.
+    # `consecutive_failures * AUDIO_STATS_POLL_SECONDS` was meant to approximate
+    # elapsed time but IS a poll count in disguise: at AUDIO_STATS_POLL_SECONDS
+    # >= STATS_POLL_GIVE_UP_SECONDS, the very first failure already satisfies
+    # `1 * interval >= 60`, so a single transient hiccup gives up immediately
+    # with zero actual retries -- reintroducing, via a different mechanism, the
+    # exact "one failed poll ends collection permanently" bug this give-up
+    # logic exists to avoid. Tracking real elapsed time is correct regardless
+    # of how AUDIO_STATS_POLL_SECONDS is tuned.
+    failures_since = None
     while True:
         await asyncio.sleep(AUDIO_STATS_POLL_SECONDS)
         try:
@@ -232,19 +251,22 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
             # likely to fail, so the metric went quiet precisely where it
             # mattered. Keep polling; give up only if the track is clearly gone.
             consecutive_failures += 1
+            if failures_since is None:
+                failures_since = time.time()
+            elapsed = time.time() - failures_since
             log.warning(
                 "get_stats failed for participant=%s (%d consecutive)",
                 participant.identity,
                 consecutive_failures,
                 exc_info=consecutive_failures == 1,
             )
-            if consecutive_failures * AUDIO_STATS_POLL_SECONDS >= STATS_POLL_GIVE_UP_SECONDS:
+            if elapsed >= STATS_POLL_GIVE_UP_SECONDS:
                 log.error(
                     "giving up stats polling for participant=%s sid=%s after %d consecutive failures (%.0fs)",
                     participant.identity,
                     publication.sid,
                     consecutive_failures,
-                    consecutive_failures * AUDIO_STATS_POLL_SECONDS,
+                    elapsed,
                 )
                 log_event(
                     "track_stats_abandoned",
@@ -255,6 +277,7 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
                 return
             continue
         consecutive_failures = 0
+        failures_since = None
 
         for stat in stats:
             if stat.WhichOneof("stats") != "inbound_rtp":
@@ -383,7 +406,31 @@ async def main() -> None:
     log.info("connecting to %s as %s (room=%s, publish=%s)", LIVEKIT_URL, IDENTITY, ROOM_NAME, PUBLISH_AUDIO)
     connect_start = time.time()
     log_event("connect_start")
-    await room.connect(LIVEKIT_URL, make_token())
+    # docker-compose's `condition: service_started` for livekit-server (and,
+    # up the chain, the agent's own healthcheck racing its actual dispatch
+    # readiness) does not guarantee the server has actually finished binding
+    # its port by the time this container starts. A bare, unguarded connect()
+    # used to propagate straight out of main() on that race -- and with no
+    # restart policy on this container, that crashed it for the rest of a
+    # multi-profile suite with nothing downstream noticing. Retried with a
+    # bounded backoff instead of failing on the first attempt; a genuine
+    # misconfiguration (bad URL, bad credentials) still fails loudly once
+    # CONNECT_MAX_RETRIES is exhausted, rather than retrying forever.
+    for attempt in range(1, CONNECT_MAX_RETRIES + 1):
+        try:
+            await room.connect(LIVEKIT_URL, make_token())
+            break
+        except Exception as exc:
+            if attempt >= CONNECT_MAX_RETRIES:
+                log.error("giving up connecting to %s after %d attempts: %r", LIVEKIT_URL, attempt, exc)
+                log_event("connect_failed", attempts=attempt, error=repr(exc))
+                raise
+            log.warning(
+                "connect attempt %d/%d to %s failed: %r, retrying in %.1fs",
+                attempt, CONNECT_MAX_RETRIES, LIVEKIT_URL, exc, CONNECT_RETRY_BACKOFF_S,
+            )
+            log_event("connect_retry", attempt=attempt, error=repr(exc))
+            await asyncio.sleep(CONNECT_RETRY_BACKOFF_S)
     time_to_first_connect_ms = (time.time() - connect_start) * 1000
     log.info("connected to room %s (time_to_first_connect_ms=%.0f)", room.name, time_to_first_connect_ms)
     log_event("connected", room=room.name, time_to_first_connect_ms=time_to_first_connect_ms)

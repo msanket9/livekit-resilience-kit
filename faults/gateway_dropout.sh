@@ -24,13 +24,21 @@ echo "== Gateway dropout: ${DROPOUT_SECONDS}s of 100% loss every ${INTERVAL_SECO
 docker run --rm \
   --name "${CONTAINER_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   --interval "${INTERVAL_SECONDS}s" \
   netem --duration "${DROPOUT_SECONDS}s" loss --percent 100 \
   -- "${TARGET_CONTAINER}" &
 PUMBA_PID=$!
 
-sleep "${DURATION_SECONDS}"
+# Backgrounded and joined via `wait`, not run as a foreground `sleep`: bash
+# defers a trapped signal until a FOREGROUND command finishes on its own, but
+# interrupts `wait` on a backgrounded job immediately. Measured directly: a
+# foreground `sleep` here left the fault fully applied for up to 55s after a
+# SIGTERM aimed at this script; this is the same pattern rural_4g.sh already
+# used (its two `wait "${PID}"` calls), which measured under 2s.
+sleep "${DURATION_SECONDS}" &
+SLEEP_PID=$!
+wait "${SLEEP_PID}"
 cleanup
 wait "${PUMBA_PID}" 2>/dev/null || true
 

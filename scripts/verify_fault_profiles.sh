@@ -40,8 +40,14 @@ sleep 1
 docker exec client-a iperf3 -c client-b -t 5
 
 echo
+# The sleep+ping+sleep+iperf3 sequence below budgets ~17-18s (measured: a
+# `ping -c 6` alone runs ~5s, dominated by its 1s interval, not RTT). A 15s
+# fault used to expire ~2s before the iperf3 client finished, so its one
+# reported throughput number silently blended ~2s of full-speed unshaped
+# traffic into what was meant to be a purely during-fault measurement. 22s
+# gives comfortable margin.
 echo "###### rural_4g (loss + jitter + ~2Mbps up / 5Mbps down) ######"
-"${FAULTS_DIR}/rural_4g.sh" client-a 15 livekit-server &
+"${FAULTS_DIR}/rural_4g.sh" client-a 22 livekit-server &
 FAULT_PID=$!
 sleep 3
 docker exec client-a ping -c 6 client-b
@@ -52,8 +58,9 @@ wait "${FAULT_PID}"
 FAULT_PID=""
 
 echo
+# Same ~17-18s budget as the rural_4g check above, same fix.
 echo "###### congested_wifi (bursty loss + jitter + 10Mbps shared) ######"
-"${FAULTS_DIR}/congested_wifi.sh" client-a 15 &
+"${FAULTS_DIR}/congested_wifi.sh" client-a 22 &
 FAULT_PID=$!
 sleep 3
 docker exec client-a ping -c 6 client-b

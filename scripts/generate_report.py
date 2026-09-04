@@ -27,6 +27,7 @@ import bisect
 import html
 import json
 import os
+import sys
 from collections import defaultdict
 
 QUALITY_LABELS = {"0": "POOR", "1": "GOOD", "2": "EXCELLENT", "3": "LOST"}
@@ -35,10 +36,29 @@ SAMPLE_RATE = 48000
 
 
 def read_jsonl(path):
+    """Parses one JSON object per non-blank line.
+
+    A malformed line is skipped with a warning rather than aborting the whole
+    file. These logs are explicitly designed to be read while their writer is
+    still appending (client.py's EVENT_LOG_PATH comment says as much, so a
+    report can be generated against a live stack), so a torn final line from
+    an in-progress write is a realistic outcome, not a contrived one -- and
+    every one of the four files this function reads is read in FULL regardless
+    of which run_id was requested. One bad line from a run nobody cares about
+    used to permanently block generating a report for any run, including the
+    newest one."""
     if not os.path.exists(path):
         return []
+    records = []
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for lineno, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"warning: skipping malformed JSON at {path}:{lineno}: {e}", file=sys.stderr)
+    return records
 
 
 def load_manifest(path, run_id):
@@ -69,7 +89,20 @@ def load_manifest(path, run_id):
 
 
 def in_window(events, start_ts, end_ts):
-    return [e for e in events if start_ts <= e["ts"] <= end_ts]
+    """Slices a TIME-SORTED events list to [start_ts, end_ts] via bisect.
+
+    Its one caller (webhook_rejoin_stats) passes index_webhooks' output, which
+    dedups and sorts across the WHOLE cross-run webhooks.jsonl (dedup has to be
+    global, since a retry's duplicate can land in a different window than its
+    original) -- so this is the same shape quality_distribution already fixed
+    with bisect: a sorted, ever-growing, cross-run list where only a small
+    slice matters for one window. A plain linear scan here was the one
+    remaining place in the file whose per-report cost keeps climbing as
+    webhooks.jsonl (explicitly append-only, never trimmed) accumulates more
+    runs, instead of being bounded by the window being asked about."""
+    lo = bisect.bisect_left(events, start_ts, key=lambda e: e["ts"])
+    hi = bisect.bisect_right(events, end_ts, key=lambda e: e["ts"])
+    return events[lo:hi]
 
 
 def _by_ts(events):
@@ -538,6 +571,20 @@ def build_summary(
     over. The indexes and episode lists below are built once and only sliced
     per window."""
     entries = sorted(manifest_entries, key=lambda e: e["start_ts"])
+    # A manifest entry with end_ts < start_ts (a hand-edited manifest, or a
+    # backward host/VM clock step between run_test_suite.sh's two `now()`
+    # calls) is not merely unusual data -- every metric here divides by
+    # (end_ts - start_ts) somewhere, and a negative window produces a
+    # negative/negative division that comes out as a confident, plausible
+    # -looking percentage instead of an error. Rejecting it here means a
+    # corrupted manifest entry is loud, not a clean-looking wrong row.
+    for e in entries:
+        if e["end_ts"] < e["start_ts"]:
+            raise SystemExit(
+                f"manifest entry for run_id={e['run_id']} profile={e['profile']} has "
+                f"end_ts ({e['end_ts']}) before start_ts ({e['start_ts']}) -- refusing "
+                "to generate a report from an inverted time window"
+            )
     run_start_ts = entries[0]["start_ts"]
 
     quality_events = index_quality(client_b_events)

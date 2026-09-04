@@ -29,12 +29,22 @@ if [ "${OUTAGE_SECONDS}" -ge "${DURATION_SECONDS}" ]; then
 fi
 
 echo "== Severe outage: ${OUTAGE_SECONDS}s of 100% loss on ${TARGET_CONTAINER}, then $((DURATION_SECONDS - OUTAGE_SECONDS))s to observe recovery =="
+# Both phases backgrounded and joined via `wait`, not run as a foreground
+# `docker run`/`sleep`: bash defers a trapped signal until a FOREGROUND
+# command finishes on its own, so a SIGTERM aimed at this script during either
+# phase did not reach `cleanup` until that phase's own duration elapsed --
+# leaving the outage fully applied for up to its remaining length. `wait` on a
+# backgrounded job is interrupted immediately, matching rural_4g.sh.
 docker run --rm \
   --name "${CONTAINER_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   netem --duration "${OUTAGE_SECONDS}s" loss --percent 100 \
-  -- "${TARGET_CONTAINER}"
+  -- "${TARGET_CONTAINER}" &
+PUMBA_PID=$!
+wait "${PUMBA_PID}"
 
-sleep "$((DURATION_SECONDS - OUTAGE_SECONDS))"
+sleep "$((DURATION_SECONDS - OUTAGE_SECONDS))" &
+SLEEP_PID=$!
+wait "${SLEEP_PID}"
 echo "== Severe outage profile done =="

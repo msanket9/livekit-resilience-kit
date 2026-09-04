@@ -187,7 +187,7 @@ A few things worth noting in that data:
   stayed "Excellent" the whole window — consistent with LiveKit's own `ConnectionQuality`
   scorer excluding jitter/RTT from its score (see "Why this exists" above).
 - **Turn count, not turn failure, is what degrades.** `turns_failed` counts turns the VAD
-  opened but never completed, and across the 58 recorded profile windows it has been
+  opened but never completed, and across the 68 recorded profile windows it has been
   non-zero exactly once. When audio stops arriving the VAD has nothing to fail on — it
   simply never opens a turn. `severe_outage` above shows 2 turns where `clean` shows 7, and
   that drop is the real signal. The report shows detected count alongside the ok/failed
@@ -304,9 +304,10 @@ What the agent leg actually detects under fault, in order of how reliably it fir
    | gateway_dropout (interval=15s) | 5/0 | 3.28s | 12.47s |
 
 3. **Outright turn failure** — a turn the VAD opens and never completes. This is the
-   rarest of the three: non-zero in 2 of 39 recorded profile windows (a `severe_outage`
-   run that failed 3 of 4 turns, and one `congested_wifi` run that failed 1 of 3). Real,
-   but not something to build a demo around.
+   rarest of the three: non-zero in 1 of 68 recorded profile windows (a `rural_4g` run
+   that failed 1 of 10 turns). Real, but not something to build a demo around. (Two
+   earlier example runs cited here in a previous revision are no longer in the manifest
+   this repo ships — this figure is recomputed from the data that's actually here.)
 
 **Response latency** is reported as the gap from the speaker's last word to the agent's
 first response frame — VAD detection hold included. It reads ~577ms and is nearly constant
@@ -322,10 +323,13 @@ so if frames stop arriving altogether it stalls instead of accumulating silence,
 inferring wall-clock end-of-speech from it would understate the real wait. Each event
 therefore also carries `since_last_frame_ms`, the wall-clock gap since the VAD last
 received a frame — a large value means that row's latency is distorted by a stall rather
-than a genuinely fast response. In practice it has stayed under 10ms in every profile
-including `severe_outage`, because a blackout produces no completed turn at all rather
-than a late one. The guard has never fired; it is there so a distorted reading cannot be
-mistaken for a good one.
+than a genuinely fast response. Across the 3,931 recorded turns, 3,863 stay within
+±10ms; the rest is not scattered noise but a single contiguous run (every turn of every
+profile in one specific run) reading close to **-1000ms**. That run coincided with heavy
+concurrent load on the host running the suite, which is the more likely explanation than
+a code defect — but it is a real recorded value, not a hypothetical, and it is evidence
+the guard *can* go meaningfully negative rather than only large-positive, which is worth
+knowing before trusting a "the guard has never fired" claim at face value.
 
 Three bugs surfaced building this, all fixed before trusting the numbers above:
 - The first version measured "response latency" as time-to-*finish-playing* the whole 1s
@@ -347,9 +351,11 @@ Three bugs surfaced building this, all fixed before trusting the numbers above:
   window of the run it belonged to. It cost the first profile of most runs one completed
   turn — `clean` read 5 where 6 had actually happened. Reconnect and agent-drop pairing had
   the same hole. The bound is the *next run's* start_ts from the manifest, not the current
-  run's own end_ts: `severe_outage` is the last profile in the suite and its agent recovery
-  lands 12–16s later, so the tighter bound reported "none recovered in-run" in three
-  recorded runs for a drop the agent demonstrably came back from.
+  run's own end_ts: `severe_outage` is the last profile in the suite, its agent recovery
+  takes 9-16s, and in three of the twelve recorded runs that recovery genuinely lands
+  after the window's own end_ts (by 0.6-3.7s) — which is what made the tighter bound wrong
+  for exactly those three, reporting "none recovered in-run" for a drop the agent
+  demonstrably came back from.
 
 The VAD model is loaded once per worker process via `WorkerOptions(prewarm_fnc=...)`, not
 per track subscription. `silero.VAD.load()` is a blocking call whose own docstring points

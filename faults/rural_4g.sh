@@ -31,7 +31,7 @@ echo "== Rural 4G: uplink shaping (loss+jitter+2Mbps) on ${UPLINK_CONTAINER} for
 docker run --rm \
   --name "${UPLINK_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   netem --duration "${DURATION}" combine \
     --delay --delay-time 100 --delay-jitter 75 \
     --loss --loss-percent 3.5 \
@@ -43,7 +43,7 @@ echo "== Rural 4G: downlink cap (5Mbps) on ${DOWNLINK_CONTAINER} for ${DURATION}
 docker run --rm \
   --name "${DOWNLINK_NAME}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  gaiaadm/pumba \
+  gaiaadm/pumba:1.2.1 \
   netem --duration "${DURATION}" rate --rate 5mbit \
     "${DOWNLINK_CONTAINER}" &
 DOWNLINK_PID=$!
