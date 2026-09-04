@@ -1,7 +1,7 @@
 # LiveKit Resilience Kit
 
 **Work in progress.** Tests how a LiveKit deployment behaves under degraded network
-conditions — packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect —
+conditions, packet loss, jitter, bandwidth caps, cellular-gateway-style drop/reconnect
 not just under scale.
 
 - [Why this exists](#why-this-exists)
@@ -19,13 +19,13 @@ not just under scale.
 
 LiveKit's own tooling (`lk load-test`, `lk perf agent-load-test`) tests **scale**: how many
 participants, how many rooms, how much throughput a deployment can handle, assuming the
-network itself is clean. It doesn't test **degradation** — what actually happens to
+network itself is clean. It doesn't test **degradation**, what actually happens to
 connection quality, reconnect time, and audio continuity when the network is bad. That's a
 routine condition for any deployment off a clean fiber/office link: call centers on
 congested lines, field-ops apps on cellular, IoT gateways that blink in and out.
 
 I've lived that gap. Running Saafwater's IoT platform — 80+ ESP32/Modbus field devices on
-cellular backhaul across Goa — meant constantly debugging PUSR M100 cellular gateways going
+cellular backhaul across Goa — meant constantly debugging our cellular gateways going
 randomly offline. I built a synthetic evaluation harness that cut incident-detection time
 from 4+ hours to under 5 minutes. This project applies the same instinct — test the real
 failure mode, not just the happy path — to LiveKit's real-time transport layer, using
