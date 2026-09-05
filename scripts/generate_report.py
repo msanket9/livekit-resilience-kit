@@ -707,7 +707,7 @@ def _ttfc_str(ttfc):
 
 
 def render_markdown(summary):
-    lines = [f"# LiveKit Resilience Report — run {summary['run_id']}", ""]
+    lines = [f"# LiveKit Resilience Report: run {summary['run_id']}", ""]
     lines.append("**Time to first connect:** " + _ttfc_str(summary["time_to_first_connect"]))
     lines.append("")
     lines.append("| " + " | ".join(COLUMNS) + " |")
@@ -727,7 +727,7 @@ def render_html(summary):
 <html>
 <head>
 <meta charset="utf-8">
-<title>LiveKit Resilience Report — {html.escape(str(summary['run_id']))}</title>
+<title>LiveKit Resilience Report: {html.escape(str(summary['run_id']))}</title>
 <style>
   body {{ font-family: -apple-system, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }}
   h1 {{ font-size: 1.3rem; }}
@@ -740,7 +740,7 @@ def render_html(summary):
 </style>
 </head>
 <body>
-  <h1>LiveKit Resilience Report — run {html.escape(str(summary['run_id']))}</h1>
+  <h1>LiveKit Resilience Report: run {html.escape(str(summary['run_id']))}</h1>
   <p class="meta">Time to first connect: {html.escape(_ttfc_str(summary['time_to_first_connect']))}</p>
   <div class="table-scroll">
   <table>

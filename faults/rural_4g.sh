@@ -5,7 +5,7 @@
 # netem only shapes a container's own egress traffic, so "up" (the field
 # client's uplink) is shaped directly on UPLINK_CONTAINER, and "down" is
 # approximated by rate-limiting DOWNLINK_CONTAINER's (the LiveKit server's)
-# egress toward the room — coarse, since it applies to every participant in
+# egress toward the room: coarse, since it applies to every participant in
 # the room, but good enough for a single-client proof of concept.
 set -euo pipefail
 

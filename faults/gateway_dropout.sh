@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Cellular gateway dropout profile: periodic full outages, mirroring a PUSR
-# M100-style cellular gateway going dark and reconnecting mid-session.
+# Cellular gateway dropout profile: periodic full outages, mirroring a
+# cellular gateway going dark and reconnecting mid-session.
 # 100% loss for a few seconds, repeating every 30-60s for the test duration.
 #
-# Doesn't rely on GNU `timeout` (absent on macOS by default) — instead runs
+# Doesn't rely on GNU `timeout` (absent on macOS by default), instead runs
 # pumba in the background and stops its container once the overall test
 # duration elapses.
 set -euo pipefail

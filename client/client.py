@@ -226,7 +226,7 @@ async def poll_track_stats(track: rtc.Track, publication: rtc.RemoteTrackPublica
     (total_freeze_duration, concealed_samples) account for this correctly.
 
     total_freeze_duration_s and jitter_buffer_delay_s are both WebRTC
-    cumulative counters (they only grow), not instantaneous values — a run's
+    cumulative counters (they only grow), not instantaneous values: a run's
     freeze total is the last-polled value, and average buffer delay is
     jitter_buffer_delay_s / jitter_buffer_emitted_count.
     """
